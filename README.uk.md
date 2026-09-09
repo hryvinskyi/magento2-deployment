@@ -1,0 +1,477 @@
+# Magento 2: деплой без простою
+
+`deploy.sh` — це один Bash-скрипт без залежностей, який розгортає Magento 2 **на місці** (у тому самому каталозі, який обслуговує вебсервер) **не зупиняючи магазин**. Працює на macOS і Linux з Bash 3.2 і новішим, і потребує лише того, що вже є на будь-якому хості Magento: PHP, Composer, `xargs`, `cp`, `mv`, `find`.
+
+English version: [README.md](README.md)
+
+---
+
+## Зміст
+
+1. [Що робиться інакше](#що-робиться-інакше)
+2. [Вимоги](#вимоги)
+3. [Встановлення](#встановлення)
+4. [Швидкий старт](#швидкий-старт)
+5. [Як відбувається деплой, фаза за фазою](#як-відбувається-деплой-фаза-за-фазою)
+6. [Модель zero-downtime і її межі](#модель-zero-downtime-і-її-межі)
+7. [Обробка помилок і відновлення](#обробка-помилок-і-відновлення)
+8. [Політики `DB_UPGRADE` і `MAINTENANCE`](#політики-db_upgrade-і-maintenance)
+9. [Pipeline-режим: зібрати один раз, викотити в іншому місці](#pipeline-режим-зібрати-один-раз-викотити-в-іншому-місці)
+10. [Довідник конфігурації](#довідник-конфігурації)
+11. [Довідник командного рядка](#довідник-командного-рядка)
+12. [Логи, звіти й ротація](#логи-звіти-й-ротація)
+13. [Блокування](#блокування)
+14. [Вивід у терміналі](#вивід-у-терміналі)
+15. [Тестування](#тестування)
+16. [Розв'язання проблем](#розвязання-проблем)
+17. [Ліцензія](#ліцензія)
+
+---
+
+## Що робиться інакше
+
+Класичний деплой Magento вмикає maintenance, видаляє `generated/` і `pub/static/`, компілює, деплоїть статику й відкриває магазин. З кількома темами й багатьма локалями це від десяти до сорока хвилин простою на кожен реліз.
+
+Цей скрипт тримає магазин онлайн увесь час збірки:
+
+| Питання | Як вирішено |
+|---|---|
+| Компіляція DI і статики | Виконується у **build-клоні** дерева коду (`var/deploy/build`), поки живі `generated/` і `pub/static/` продовжують обслуговувати трафік. |
+| Багатоядерна статика | Один процес `setup:static-content:deploy` на кожну пару (тема, локаль), розпаралелений через `xargs -P` на всі ядра. Власна опція Magento `--jobs` не використовується. |
+| Викочування нових артефактів | **Перейменування** каталогів (`mv`), це мілісекунди. Замінені артефакти зберігаються, доки реліз не перевірено. |
+| Оптимізований classmap Composer | Генерується **після** `setup:di:compile`, у клоні, і свапається разом із `generated/`, тож classmap ніколи не вказує на відсутні файли. |
+| `setup:upgrade` | Запускається **лише** коли виявлено зміни в БД: `setup:db:status` плюс відбиток `db_schema.xml`, `db_schema_whitelist.json`, `module.xml`, файлів `Setup/` і `app/etc/config.php`. |
+| Maintenance-режим | Вмикається **лише** на час `setup:upgrade` (політика `auto`). Реліз без змін у БД має нульовий простій. |
+| Усе інше | Блокування, pre/post-хуки, скидання OPcache, health check, бекап БД, білий список IP, dry run, логи, звіти, ротація, майстер конфігурації. |
+
+---
+
+## Вимоги
+
+- Magento 2.3+ (тестовано на 2.4.x), встановлена в каталог із правом запису.
+- Bash 3.2+ (стандартний на macOS) або будь-який новіший Bash на Linux.
+- PHP CLI з розширеннями, потрібними Magento; Composer 2 (`composer.phar` у корені Magento виявляється автоматично).
+- `xargs` з `-P` (GNU або BSD), `cp`, `mv`, `find`, `cksum`, `sort`, `mktemp`, `df`.
+- `var/` має бути на **тій самій файловій системі**, що `pub/` і `generated/`. Hardlink-клони й атомарні перейменування не працюють між файловими системами; скрипт перевіряє це у preflight.
+- Необов'язково: `flock` (Linux; на macOS використовується PID-файл), `curl` для health check, `mysqldump` для вбудованого бекапу, `rsync` і `ssh` для `--push`.
+- Вільне місце на диску для однієї додаткової копії `generated/` і `pub/static/` під час збірки (старе й нове існують поруч).
+
+---
+
+## Встановлення
+
+Виконайте в корені Magento:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hryvinskyi/magento2-deployment/main/install.sh | bash
+```
+
+Опції передаються після `bash -s --`:
+
+```bash
+# встановити в інший каталог, зафіксувати тег
+curl -fsSL https://raw.githubusercontent.com/hryvinskyi/magento2-deployment/main/install.sh \
+  | bash -s -- --dir /var/www/html --ref v3.0.0
+
+# не завантажувати .deploy.env.example
+curl -fsSL .../install.sh | bash -s -- --no-config
+```
+
+Інсталятор завантажує `deploy.sh`, перевіряє його через `bash -n`, робить виконуваним і додає `.deploy.env.example`. Повторний запуск оновлює `deploy.sh` на місці і зберігає попередню копію як `deploy.sh.bak`, якщо вона відрізняється. Змінні оточення `MAGENTO_DIR` і `DEPLOY_REF` враховуються; `DEPLOY_BASE_URL` перевизначає джерело завантаження (дзеркала, тести).
+
+Ручне встановлення — просто скопіювати `deploy.sh` у корінь Magento і `chmod +x deploy.sh`.
+
+---
+
+## Швидкий старт
+
+```bash
+cd /var/www/html
+./deploy.sh --init        # читає теми й локалі з бази, пише .deploy.env
+./deploy.sh --dry-run     # показує кожну команду, нічого не змінює
+./deploy.sh               # деплоїть
+```
+
+Типовий `.deploy.env` для продакшн-хоста:
+
+```ini
+MAGENTO_DIR=/var/www/html
+PHP_BIN=php8.3
+COMPOSER_BIN=/usr/local/bin/composer
+FRONTEND_THEMES=Vendor/theme,Vendor/other
+FRONTEND_LANGUAGES=en_GB de_DE fr_FR
+BACKEND_THEME=Magento/backend
+BACKEND_LANGUAGES=en_US en_GB
+PARALLEL_JOBS=12
+OPCACHE_RESET_CMD=sudo systemctl reload php8.3-fpm
+HEALTHCHECK_URL=https://www.example.com/
+DB_BACKUP=true
+PRE_DEPLOY_CMD=git pull --ff-only
+```
+
+Звичайний реліз — це `git pull` (або pre-deploy-хук) і далі `./deploy.sh`.
+
+---
+
+## Як відбувається деплой, фаза за фазою
+
+```
+preflight → pre-deploy hook → composer (наживо) → перевірка БД → build (наживо) → release → verify → post-deploy hook
+```
+
+### 1. Preflight
+
+- Перетворює `MAGENTO_DIR` на абсолютний шлях і перевіряє `app/etc/env.php`, `bin/magento`, `composer.json`. Виправляє невиконуваний `bin/magento`.
+- Перевіряє PHP-бінарник і розширення, потрібні Magento (`bcmath ctype curl dom gd iconv intl mbstring openssl pdo_mysql simplexml soap xsl zip sockets`); попереджає про відсутні `redis`, `apcu`, `opcache`.
+- Знаходить Composer як абсолютний шлях (`COMPOSER_BIN`, `$PATH`, `composer.phar` у корені), бо він запускається через `$PHP_BIN` із заданим `memory_limit`.
+- Перевіряє кожну опцію; некоректні значення повертаються до типових із попередженням.
+- Перевіряє, що `BUILD_DIR` (типово `var/deploy`) на тій самій файловій системі, що `pub/`.
+- Показує ядра CPU, вільну пам'ять і диск. `PARALLEL_JOBS` типово дорівнює кількості ядер і обмежується нею; попередження виводиться, якщо процесам потрібно більше пам'яті, ніж є (близько 700 МБ на процес).
+- Бере блокування деплою (див. [Блокування](#блокування)).
+- Попереджає при запуску від root (файли будуть належати root).
+
+Помилки валідації запитують підтвердження продовжити; з `--no-interaction` або без термінала деплой переривається.
+
+### 2. Pre-deploy hook
+
+`PRE_DEPLOY_CMD` виконується в каталозі Magento з показом виводу. Ненульовий код виходу перериває деплой до будь-яких змін. Тут доречні `git pull --ff-only`, сповіщення або власні перевірки.
+
+### 3. Composer (сайт онлайн)
+
+`composer install --no-dev --no-interaction --no-progress --prefer-dist` виконується на місці з `composer.lock` (відсутній lock-файл перериває деплой). Магазин продовжує працювати: Composer замінює пакети атомарно по файлах, а OPcache тримає старий байткод, доки його не скинуть.
+
+Composer тут пише **звичайний** автозавантажувач. Оптимізований classmap навмисно **не** генерується на цьому етапі: `composer dump-autoload --optimize` жорстко прописує кожен файл із `generated/code`, а цей каталог зараз буде замінено. Див. фазу 5.
+
+`--skip-composer` пропускає цю фазу.
+
+### 4. Перевірка БД
+
+1. Видаляється залишений прапорець `var/.regenerate`. Magento видаляє `generated/` і `var/cache` під час **наступного запуску** за наявності цього прапорця (його залишають `module:enable` / `module:disable`). На живому продакшні це вікно фатальних помилок, а цей деплой і так перезбирає згенерований код. З `--skip-di-compile` виводиться попередження, що код, який Magento хотіла перезібрати, зберігається.
+2. `setup:db:status` — код виходу 2 означає, що версії модулів вимагають апгрейду.
+3. `app:config:status` — код 2 означає, що в `config.php` / `env.php` є налаштування, яких ще немає в базі.
+4. **Відбиток БД.** `setup:db:status` порівнює лише значення `setup_version`; модулі без нього (усі модулі з декларативною схемою й data-патчами) завжди вважаються актуальними. Тому скрипт рахує контрольну суму всіх `db_schema.xml`, `db_schema_whitelist.json`, `module.xml` і `Setup/**/*.php` у `app/code` та `vendor`, плюс `app/etc/config.php`, зі шляхами відносно кореня Magento. Значення останнього успішного апгрейду зберігається в `var/deploy/db-fingerprint`. Інше значення означає нову схему або патчі, і `setup:upgrade` потрібен. Без збереженого значення (перший запуск або після очищення `var/`) апгрейд виконується один раз, щоб створити базову лінію.
+5. Застосовується політика `DB_UPGRADE` (див. [Політики](#політики-db_upgrade-і-maintenance)).
+6. Якщо очікується імпорт конфігурації і апгрейд не запускатиметься, `app:config:import` виконується **зараз**, на живому сайті. Це швидко, безпечно і потрібно до збірки, щоб деплой статики побачив нові store view або теми з `config.php`. Якщо апгрейд буде, `setup:upgrade` покриває імпорт.
+
+`--skip-db-check` пропускає всю фазу: без status-команд, без апгрейду, без оновлення відбитка.
+
+### Production-режим
+
+Перевіряється `deploy:mode:show`; якщо режим не `production`, `deploy:mode:set production --skip-compilation` записує лише `env.php` (без очищення і компіляції). Це робиться до збірки, щоб клон скопіював фінальний `env.php`.
+
+### 5. Build (сайт онлайн)
+
+Повністю пропускається з `--skip-di-compile --skip-static`; клон створюється лише коли є що збирати.
+
+**Клон.** `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json` і `composer.lock` клонуються у `var/deploy/build`:
+
+- Linux: `cp -al` (hardlink; 160 000 файлів vendor займають кілька секунд і не потребують місця);
+- macOS на APFS: `cp -Rpc` (copy-on-write клони);
+- запасний варіант: звичайне рекурсивне копіювання.
+
+Hardlink ділить inode із живим файлом, тому все, що перезаписує файл **на місці** всередині клона, змінило б живе дерево. Команди компіляції та статики Magento ніколи не пишуть в `app/`, `lib/` чи `vendor/`, але файли, які *справді* перезаписуються, **від'єднуються** (замінюються приватними копіями): `app/etc/env.php`, `app/etc/config.php`, а перед дампом автозавантажувача `vendor/composer/`, `vendor/autoload.php`, `app/etc/NonComposerComponentRegistration.php`.
+
+Клон отримує свіжі порожні `generated/`, `var/` і `pub/static/`, а `pub/media` — це symlink на живий каталог медіа (деплой статики його лише читає). `bin/magento` клона визначає своїм коренем клон, тож усі шляхи Magento (`generated/code`, `pub/static`, `var/view_preprocessed`, `var/cache`) потрапляють у клон. Файли реєстрації модулів і тем теж резолвляться в шляхи клона, що задовольняє валідатор шляхів Magento (symlink-тіньовий корінь там би не пройшов).
+
+З `--skip-di-compile`, але з увімкненою статикою, живі `generated/code` і `generated/metadata` клонуються всередину, щоб статика деплоїлась проти скомпільованого коду.
+
+**Компіляція.** `setup:di:compile` виконується в клоні з однією повторною спробою. Зауважте: компілятор Magento на старті очищує налаштований кеш-бекенд (включно з Redis) так само, як і при класичному деплої.
+
+**Оптимізований автозавантажувач.** `composer dump-autoload --optimize --apcu --no-plugins --working-dir=<клон>` будує classmap проти щойно згенерованого коду. Результат (`vendor/composer/`, `vendor/autoload.php`) свапається разом із `generated/` у фазі release. `--apcu` безпечний без розширення; `--no-plugins` не повторює побічні дії плагінів, які вже відбулися під час живого `composer install`.
+
+**Статика.** Формується список завдань: кожна frontend-тема × кожна frontend-локаль, плюс backend-тема × кожна backend-локаль. Кожне завдання — окремий процес:
+
+```
+php -d memory_limit=-1 var/deploy/build/bin/magento setup:static-content:deploy \
+    --area=<area> --theme=<theme> --no-parent --force --max-execution-time=3600 [--no-js-bundle] [SCD_EXTRA_ARGS] <locale>
+```
+
+Для `adminhtml` додається `--no-js-bundle`. Завдання виконуються через `xargs -P $PARALLEL_JOBS`; у терміналі живий лічильник показує `n/m jobs`, інакше кожне завершене завдання виводить рядок. Кожне завдання пише власний лог; після фази вони зливаються в основний лог у порядку завдань. Паралельний деплой локалей безпечний, бо кожна локаль пише у свій каталог `pub/static/<area>/<theme>/<locale>/`; `deployed_version.txt` пише кожне завдання і перемагає останній запис, що нормально, бо версія — лише cache-buster в URL.
+
+Одне невдале завдання провалює збірку. Невдалі завдання перелічуються зі шляхами до логів, і нічого не свапалось, тож живий сайт не зачеплено.
+
+### 6. Release
+
+Заголовок фази каже, чи буде maintenance-вікно і чому.
+
+1. **Бекап БД** (коли буде `setup:upgrade` і задано `DB_BACKUP=true` або `DB_BACKUP_CMD`). Виконується **до** maintenance-вікна, тож не додає простою. Вбудований бекап читає реквізити з `app/etc/env.php` (підтримується запис `host:port`) і пише gzip-дамп `mysqldump --single-transaction` у `var/backups/deploy_db_<timestamp>.sql.gz`.
+2. **Maintenance-режим** вмикається лише коли буде `setup:upgrade` (`MAINTENANCE=auto`) або при `MAINTENANCE=always`. `MAINTENANCE_ALLOWED_IPS` передаються як опції `--ip`.
+3. **Своп артефактів.** Для кожного артефакту живий каталог переміщується у `var/deploy/previous/<шлях>`, а зібраний — на його місце:
+   - `generated/code`, `generated/metadata`, `vendor/composer`, `vendor/autoload.php` (якщо компілювали);
+   - `var/view_preprocessed` і кожен елемент `pub/static/` клона, крім `.htaccess` — зазвичай `frontend`, `adminhtml`, `deployed_version.txt` (якщо деплоїли статику);
+   - `pub/static/_cache` (злиті/мініфіковані бандли зі старих джерел) прибирається, він відновлюється на вимогу.
+   Кожен своп — це два перейменування; проміжок між ними — мікросекунди. Якщо друге перейменування не вдалося, попередня версія повертається негайно. `.htaccess`, `pagespeed_cache` та інші власні елементи в `pub/static` залишаються на місці.
+4. **`setup:upgrade --keep-generated --no-interaction`** виконується за потреби. `--keep-generated` тут коректний, бо згенерований код скомпільовано саме з цього коду у фазі build. Після успіху зберігається відбиток БД.
+5. **`cache:flush`** (невдача лише попереджає).
+6. **Скидання OPcache** через `OPCACHE_RESET_CMD`. З `opcache.validate_timestamps=0` php-fpm обслуговує попередній реліз із OPcache, доки його не скинути чи не перезавантажити; без команди виводиться нагадування.
+7. **Maintenance-режим** вимикається, якщо був увімкнений. Простій вимірюється й виводиться в підсумку.
+
+### 7. Verify
+
+- **Health check**: `curl` запитує `HEALTHCHECK_URL` (з переходом за редиректами) до `HEALTHCHECK_RETRIES` разів по `HEALTHCHECK_TIMEOUT` секунд; усе, крім HTTP 2xx, провалює деплой.
+- **Пост-перевірки**: кількість файлів у `generated/code`, `generated/metadata`, `pub/static`, наявність `pub/static/deployed_version.txt`, режим застосунку, статус maintenance.
+- Попередні артефакти у `var/deploy/previous` видаляються (зберігаються з `--keep-previous`), build-клон прибирається.
+
+### 8. Post-deploy hook
+
+`POST_DEPLOY_CMD` виконується в каталозі Magento. Невдача — лише попередження, бо сам деплой уже успішний. Типове використання: прогрів кешу, сповіщення, очищення Varnish.
+
+### Підсумок і звіт
+
+Термінал показує зелений банер `DEPLOYMENT COMPLETE` із загальною тривалістю і виміряним простоєм, шляхи до логу і звіту, час кожного кроку, кількість попереджень і помилок. Текстовий звіт пишеться у `var/log/deploy_report_<timestamp>.txt` із конфігурацією, git-ревізією, таймінгами кроків, а також помилками і попередженнями з логу.
+
+---
+
+## Модель zero-downtime і її межі
+
+Що гарантується, а що ні, щоб не було сюрпризів:
+
+- **Без maintenance-вікна, якщо немає змін у БД.** Компіляція, статика, classmap і своп відбуваються з магазином онлайн.
+- **Перейменування, а не видалення.** Старі `generated/` і `pub/static/` ніколи не видаляються до появи нових. Сам своп — це серія `mv`, мілісекунди.
+- **URL статики працюють через своп.** Magento віддає `static/version<N>/…` через rewrite, який ігнорує версію, тож сторінки в Varnish або full page cache зі старою версією далі резолвляться на нові файли.
+- **Код оновлюється на місці до збірки.** З git-checkout у docroot `git pull` і `composer install` змінюють `app/`, `vendor/`, поки живе ще попереднє `generated/`. Це вікно є і при класичному деплої; скрипт його зберігає і не збільшує шкоду: помилка в цьому вікні можлива лише для класу, у якого змінилася сигнатура конструктора *і* який має згенерований interceptor чи proxy. Повністю закрити його можна лише схемою `releases/<n>` + symlink `current` і зміною docroot вебсервера, а це за межами того, що може зробити in-place-скрипт. `--build-only` + `--artifacts` (див. [Pipeline-режим](#pipeline-режим-зібрати-один-раз-викотити-в-іншому-місці)) скорочує вікно до самого свопу, якщо код потім деплоїться цілком.
+- **`setup:di:compile` очищує кеш-бекенд на старті.** Це поведінка Magento; живий сайт перебудовує кеш із незміненої конфігурації, поки триває компіляція.
+- **Пакети vendor не свапаються.** `composer install` виконується на місці; у своп входять лише файли автозавантажувача в `vendor/composer` і `vendor/autoload.php`.
+- **`setup:upgrade` завжди потребує вікна** у політиці `auto`. Його тривалість і є простоєм; бекап і вся збірка — поза ним.
+
+---
+
+## Обробка помилок і відновлення
+
+Скрипт завершується ненульовим кодом, виводить червоний банер `DEPLOYMENT FAILED` із кроком і фазою, останні 20 рядків виводу невдалої команди і констатацію стану живого сайту:
+
+| Де сталася помилка | Стан живого сайту | Що робити |
+|---|---|---|
+| Preflight, pre-deploy hook | Не зачеплено. | Виправити проблему, запустити знову. |
+| Composer install | `vendor/` може бути частково оновлений; згенерований код і статика не зачеплені. | Запустити знову (Composer продовжить). |
+| Перевірка БД, імпорт конфігурації | Нічого не свапалось. | Прочитати вивід команди в лозі, запустити знову. |
+| Build (клон, компіляція, classmap, статика) | **Не зачеплено.** Build-клон залишається у `var/deploy/build` для аналізу і прибирається наступним запуском. | Виправити причину (зазвичай помилка в коді), запустити знову. |
+| Release до `setup:upgrade` (невдалий своп) | Своп повертає попередній елемент, якщо друге перейменування не вдалося. | Перевірити місце на диску і права, запустити знову. |
+| `setup:upgrade` | **Maintenance-режим залишається УВІМКНЕНИМ.** Нові артефакти вже живі, попередні — у `var/deploy/previous`. | Виправити проблему апгрейду і запустити деплой знову, або відновити вручну: перенести кожен елемент із `var/deploy/previous` назад (наприклад `generated/code`, `vendor/composer`, `pub/static/frontend`), потім `bin/magento maintenance:disable`. Дамп `DB_BACKUP` лежить у `var/backups/`. |
+| Health check | Сайт відкритий, але повернув не-2xx; попередні артефакти збережено. | Перевірити сайт; за потреби відновити з `var/deploy/previous`. |
+| Перервано (Ctrl+C, SIGTERM) | Дочірні процеси вбито; стан як у рядку відповідної фази. | Як вище. |
+
+Maintenance-режим навмисно **не** вимикається автоматично після невдалого апгрейду: напівоновлену базу не варто відкривати наосліп.
+
+Блокування знімається на кожному шляху виходу, тож наступному запуску ніколи не треба прибирати застаріле блокування після краху (PID-блокування на macOS розпізнає мертві процеси).
+
+---
+
+## Політики `DB_UPGRADE` і `MAINTENANCE`
+
+| `DB_UPGRADE` | Поведінка |
+|---|---|
+| `auto` (типово) | `setup:upgrade` виконується, коли `setup:db:status` повідомляє про зміни, коли змінився відбиток БД або коли базової лінії відбитка ще немає. |
+| `always` | Завжди виконувати `setup:upgrade`. |
+| `never` | Ніколи не виконувати; при виявлених змінах виводиться попередження. Відбиток не оновлюється. |
+
+| `MAINTENANCE` | Поведінка |
+|---|---|
+| `auto` (типово) | Maintenance лише на час `setup:upgrade`. Без апгрейду реліз узагалі не має вікна. |
+| `always` | Уся фаза release (своп, апгрейд, скидання кешу і OPcache) виконується у вікні. Для випадків, коли реліз має бути атомарним з точки зору відвідувача. |
+| `never` | Ніколи не чіпати maintenance, навіть для `setup:upgrade` (виводиться попередження). |
+
+`MAINTENANCE_ALLOWED_IPS` додає адреси в білий список на час вікна. `--skip-db-check` вимикає апгрейд незалежно від `DB_UPGRADE`.
+
+---
+
+## Pipeline-режим: зібрати один раз, викотити в іншому місці
+
+Фаза build створює звичайні файли: `generated/`, `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. Жоден із них не містить абсолютних шляхів, тож їх можна зібрати на робочій станції чи CI-раннері й викотити на сервері.
+
+```bash
+# на машині збірки (той самий коміт, той самий composer.lock, той самий app/etc/config.php)
+./deploy.sh --build-only                      # артефакти залишаються у var/deploy/build
+./deploy.sh --push www@shop:/var/www/html     # збірка + rsync через SSH у <root>/var/deploy/incoming
+./deploy.sh --push www@shop:/var/www/html --push-run   # ... і запуск релізу на сервері
+
+# на сервері
+./deploy.sh --artifacts /var/www/html/var/deploy/incoming
+```
+
+`--artifacts` пропускає Composer і збірку; заданий каталог стейджиться у `var/deploy/build` і проходить звичайні фази (перевірка БД, своп, `setup:upgrade` за потреби, скидання кешу, OPcache, health check). Використовуйте `--skip-static` або `--skip-di-compile`, якщо артефакти навмисно містять лише одну з двох груп.
+
+Обмеження:
+
+- Машина збірки має бути на тому самому коміті з тим самим `composer.lock` і тим самим `app/etc/config.php` (список модулів).
+- Налаштування статики, які Magento читає з бази під час `setup:static-content:deploy` (мініфікація, злиття, бандлінг, підпис), мають збігатися з продакшном, або їх треба вивантажити в `config.php` через `app:config:dump`.
+- Обсяг передачі: `pub/static` для багатьох тем і локалей — це гігабайти; дельти `rsync` допомагають при повторних деплоях.
+
+---
+
+## Довідник конфігурації
+
+Задається у `.deploy.env` (KEY=VALUE, коментарі `#`, лапки необов'язкові) або в оточенні. Пріоритет: **прапорці CLI > оточення > `.deploy.env` > типові**. Файл шукається в такому порядку: `--config FILE`, `MAGENTO_DIR/.deploy.env`, каталог скрипта, поточний каталог.
+
+| Ключ | Типово | Значення |
+|---|---|---|
+| `MAGENTO_DIR` | `.` | Корінь Magento. |
+| `PHP_BIN` | `php` | Бінарник PHP CLI. |
+| `COMPOSER_BIN` | `composer` | Бінарник або phar Composer; резолвиться в абсолютний шлях. |
+| `PHP_MEMORY_LIMIT` | `-1` | `memory_limit` для кожного виклику PHP/Composer; порожнє значення лишає `php.ini`. |
+| `FRONTEND_THEMES` | `Magento/luma,Magento/blank` | Frontend-теми через кому. |
+| `FRONTEND_LANGUAGES` | `en_GB` | Frontend-локалі через пробіл або кому. |
+| `BACKEND_THEME` | `Magento/backend` | Backend-тема. |
+| `BACKEND_LANGUAGES` | `en_US` | Backend-локалі. |
+| `PARALLEL_JOBS` | ядра CPU | Одночасні процеси статики (обмежено кількістю ядер). |
+| `SCD_EXTRA_ARGS` | порожньо | Додаткові опції для кожного `setup:static-content:deploy`. |
+| `DB_UPGRADE` | `auto` | `auto`, `always`, `never`. |
+| `MAINTENANCE` | `auto` | `auto`, `always`, `never`. |
+| `MAINTENANCE_ALLOWED_IPS` | порожньо | IP, дозволені під час вікна. |
+| `BUILD_DIR` | `var/deploy` | Каталог збірки, попередніх артефактів і стану. |
+| `KEEP_PREVIOUS` | `false` | Зберігати `var/deploy/previous` після успіху. |
+| `ARTIFACTS_DIR` | порожньо | Викотити готові артефакти з цього каталогу (`--artifacts`). |
+| `BUILD_ONLY` | `false` | Зупинитися після збірки (`--build-only`). |
+| `PUSH_TARGET`, `PUSH_RUN` | порожньо, `false` | `--push`, `--push-run`. |
+| `SKIP_COMPOSER`, `SKIP_DB_CHECK`, `SKIP_STATIC`, `SKIP_DI_COMPILE` | `false` | Пропуск фаз. |
+| `PRE_DEPLOY_CMD` | порожньо | Хук до будь-яких змін; невдача перериває. |
+| `POST_DEPLOY_CMD` | порожньо | Хук після успіху; невдача попереджає. |
+| `OPCACHE_RESET_CMD` | порожньо | Виконується одразу після свопу. Обов'язковий при `opcache.validate_timestamps=0`. |
+| `HEALTHCHECK_URL` | порожньо | URL, який після релізу має повернути HTTP 2xx. |
+| `HEALTHCHECK_RETRIES` | `3` | Кількість спроб. |
+| `HEALTHCHECK_TIMEOUT` | `30` | Секунд на спробу. |
+| `DB_BACKUP` | `false` | Вбудований mysqldump перед `setup:upgrade`. |
+| `DB_BACKUP_CMD` | порожньо | Власна команда бекапу замість mysqldump. |
+| `LOG_FILE` | `var/log/deploy_<timestamp>.log` | Основний лог. |
+| `LOG_RETENTION_DAYS` | `30` | Видаляти старі логи, звіти, бекапи (0 вимикає). |
+| `VERBOSE`, `DRY_RUN`, `NO_INTERACTION` | `false` | Як відповідні прапорці. |
+| `DEPLOY_ASCII` | `false` | ASCII-символи замість Unicode. |
+| `NO_COLOR` | не задано | Вимкнути кольори (стандартна змінна). |
+
+Усі хук-команди виконуються з каталогом Magento як робочим, через eval, тож працюють пайпи та `&&`.
+
+---
+
+## Довідник командного рядка
+
+```
+deploy.sh [OPTIONS]
+
+-h, --help              Довідка
+--init                  Майстер конфігурації: пише .deploy.env, прочитавши теми й локалі з бази
+--config FILE           Файл конфігурації
+-d, --dir PATH          Корінь Magento
+-p, --php PATH          Бінарник PHP
+-c, --composer PATH     Бінарник Composer
+-j, --jobs NUM          Паралельні процеси статики
+--db-upgrade MODE       auto | always | never
+--maintenance MODE      auto | always | never
+--memory-limit LIMIT    PHP memory_limit
+--skip-composer         Пропустити composer install
+--skip-db-check         Пропустити перевірки статусу і setup:upgrade
+--skip-static           Залишити поточну статику
+--skip-di-compile       Залишити поточний згенерований код і автозавантажувач
+--keep-previous         Зберегти замінені артефакти у var/deploy/previous
+--build-only            Зібрати, не викочувати
+--artifacts DIR         Викотити готові артефакти з DIR
+--push user@host:DIR    Зібрати і rsync-нути артефакти на сервер (передбачає --build-only)
+--push-run              Після --push запустити deploy.sh --artifacts на сервері через ssh -t
+--dry-run               Показати кожну команду, нічого не змінювати
+--no-interaction        Ніколи не запитувати
+--ascii                 ASCII-вивід
+-v, --verbose           Стрімити вивід команд, показувати debug-рядки
+--log FILE              Шлях основного логу
+--log-retention DAYS    Ротація логів/звітів/бекапів
+--frontend-themes T     Теми через кому
+--backend-theme T
+--frontend-langs L      Локалі через пробіл/кому
+--backend-langs L
+```
+
+Приклади:
+
+```bash
+./deploy.sh                                   # повний деплой без простою
+./deploy.sh --dry-run -v                      # попередній перегляд, докладно
+./deploy.sh -j 16                             # 16 процесів статики
+./deploy.sh --skip-static --skip-di-compile   # реліз лише коду (composer + перевірка БД + скидання кешу)
+./deploy.sh --db-upgrade never                # перший запуск на хості з точно актуальною базою
+./deploy.sh --maintenance always              # атомарний реліз в одному вікні
+./deploy.sh --build-only                      # лише зібрати артефакти
+./deploy.sh --push www@shop:/var/www/html --push-run
+```
+
+---
+
+## Логи, звіти й ротація
+
+- Основний лог: `var/log/deploy_<timestamp>.log`. Містить кожне повідомлення з рівнем і часом, повний вивід кожної команди, логи статики по локалях (злиті після фази), а також вивід `setup:db:status` / `app:config:status`.
+- Звіт: `var/log/deploy_report_<timestamp>.txt` (також при невдачі).
+- Бекапи БД: `var/backups/deploy_db_<timestamp>.sql.gz`.
+- Ротація: файли старші за `LOG_RETENTION_DAYS` видаляються на старті запуску (`deploy_*.log`, `deploy_report_*.txt`, каталоги `deploy_*_scd`, `deploy_db_*.sql.gz`, а також старі `deployment_*.log` у корені). `0` вимикає.
+- `var/deploy/db-fingerprint` зберігає відбиток останнього успішного апгрейду. Його видалення спричиняє рівно один додатковий `setup:upgrade`.
+
+Додайте `var/deploy/` і `var/backups/` у `.gitignore`, якщо корінь Magento — це git-checkout.
+
+---
+
+## Блокування
+
+Паралельні деплої відхиляються. Де є `flock`, блокування — це kernel lock на `var/.deploy.lock`, який автоматично знімається зі смертю процесу. Інакше (стандартний macOS) атомарно створюється PID-файл; PID, якого більше не існує, вважається застарілим і замінюється з попередженням. `--dry-run` блокування не бере.
+
+---
+
+## Вивід у терміналі
+
+У терміналі скрипт показує заголовки фаз, спінери з часом для довгих команд, живий лічильник `n/m jobs` для статики і фінальний підсумок із таймінгами кроків і виміряним простоєм. Кольори підкоряються `NO_COLOR`; Unicode-символи використовуються, коли локаль UTF-8, і вимикаються через `--ascii` / `DEPLOY_ASCII=true`. Без термінала (cron, CI) та сама інформація виводиться простими рядками, по одному на подію, що зберігає читабельність логів. `-v` стрімить вивід кожної команди під час виконання.
+
+Приклад (скорочено):
+
+```
+▸ Database check
+  ✔ setup:db:status: module versions up to date
+  ✔ app:config:status: configuration up to date
+  ✔ Database fingerprint unchanged (no new schema or patches)
+    setup:upgrade skipped - no database changes
+▸ Build  site live, building in var/deploy/build
+  ✔ Cloned code tree into var/deploy/build (hardlink)  4s
+  ✔ setup:di:compile  2m 41s
+  ✔ composer dump-autoload --optimize --apcu (build)  21s
+  ✔ Static content: 84 jobs on 16 cores  6m 12s · slowest: frontend Vendor/theme de_DE 1m 48s
+▸ Release  zero downtime: no maintenance window needed
+  ✔ Swapped 7 artifacts into place: generated/code generated/metadata vendor/composer vendor/autoload.php var/view_preprocessed pub/static/adminhtml pub/static/deployed_version.txt pub/static/frontend  0s
+  ✔ cache:flush  3s
+  ✔ opcache reset: sudo systemctl reload php8.3-fpm  1s
+▸ Verify
+  ✔ Health check: https://www.example.com/ → HTTP 200  (attempt 1, 1s)
+
+   DEPLOYMENT COMPLETE    in 9m 40s · downtime 0s
+```
+
+---
+
+## Тестування
+
+`scripts/test-deploy.sh` запускає скрипт проти тимчасової пісочниці зі стаб-бінарниками `php`, `composer`, `curl`, `mysqldump`, `ssh` і `rsync`. Фейковий `bin/magento` визначає корінь із шляху виклику, тож тести доводять, що компіляція і статика справді виконуються в клоні, що живе дерево не зачіпається при невдачах, що своп, логіка відбитка, політики, хуки, бекап, health check, pipeline-режим і блокування поводяться як задокументовано. Реальний магазин, база чи мережа ніколи не зачіпаються.
+
+```bash
+bash scripts/test-deploy.sh
+```
+
+CI (`.github/workflows/ci.yml`) запускає ShellCheck, набір тестів на Ubuntu (flock, hardlink) і macOS (PID-блокування, APFS-клони, Bash 3.2), а також встановлення з запушеного коміту.
+
+---
+
+## Розв'язання проблем
+
+**`include(...generated/code/.../Proxy.php): Failed to open stream` одразу після Composer.** Оптимізований classmap посилався на згенеровані файли, які Magento видалила через наявний `var/.regenerate`. Версія 3 ніколи не робить оптимізований дамп на живому дереві і видаляє прапорець перед першим викликом `bin/magento`. Запустіть деплой знову; звичайний автозавантажувач відновлює відсутні proxy на вимогу.
+
+**`BUILD_DIR is on a different filesystem`.** Перейменування і hardlink потребують однієї файлової системи. Задайте `BUILD_DIR` на тому самому розділі, що `pub/` і `generated/`.
+
+**Перший запуск вмикає maintenance, хоча нічого не змінилося.** Базової лінії відбитка ще не було. Запустіть один раз із `--db-upgrade never`, якщо база точно актуальна; базова лінія запишеться під час наступного справжнього апгрейду.
+
+**Процесам статики бракує пам'яті.** Зменшіть `-j` / `PARALLEL_JOBS`; кожен процес потребує близько 700 МБ. Preflight попереджає, коли задані процеси перевищують доступну пам'ять.
+
+**`Path "..." cannot be used with directory "..."` під час деплою статики.** Модуль або тема зареєстровані зі шляху поза коренем Magento (symlink на модуль). Перенесіть їх усередину кореня; build-клон вимагає справжніх файлів або hardlink, а не symlink на інші місця.
+
+**Магазин далі віддає старий код після релізу.** php-fpm працює з `opcache.validate_timestamps=0`. Задайте `OPCACHE_RESET_CMD` (`cachetool opcache:reset` або reload php-fpm).
+
+**Maintenance досі увімкнений після невдачі.** Це навмисно після невдалого `setup:upgrade`. Виправте, перезапустіть або відновіть із `var/deploy/previous`, потім `bin/magento maintenance:disable`.
+
+**Злиті CSS/JS виглядають застарілими.** `pub/static/_cache` прибирається при кожному деплої статики; якщо запускаєте з `--skip-static`, видаліть його вручну або очистіть кеш статичних файлів в адмінці.
+
+---
+
+## Ліцензія
+
+MIT, див. [LICENSE](LICENSE).
