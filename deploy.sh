@@ -47,7 +47,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.1.0"
+DEPLOY_VERSION="3.1.1"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -1554,16 +1554,30 @@ detach_dir() {
     cp -Rp "$BUILD_ROOT/$rel" "$tmp" && rm -rf "${BUILD_ROOT:?}/${rel:?}" && mv "$tmp" "$BUILD_ROOT/$rel"
 }
 
+# Everything a DI compiler leaves under generated/ (code, metadata, and for
+# example staticcache from creatuity/magento2-interceptors), minus .htaccess.
+# Usage: list_generated_entries ROOT  -> prints "generated/<name>" lines
+list_generated_entries() {
+    local entry name
+    for entry in "$1"/generated/* "$1"/generated/.[!.]*; do
+        [[ -e "$entry" ]] || continue
+        name="$(basename "$entry")"
+        [[ "$name" == ".htaccess" || "$name" == ".DS_Store" ]] && continue
+        printf 'generated/%s\n' "$name"
+    done
+    return 0
+}
+
 # Copy the live generated code into the build (kept with --skip-di-compile)
 import_live_generated() {
     local entry
-    for entry in generated/code generated/metadata; do
-        [[ -d "$MAGENTO_DIR/$entry" ]] || continue
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
         [[ -e "$BUILD_ROOT/$entry" ]] && rm -rf "${BUILD_ROOT:?}/$entry"
         mkdir -p "$BUILD_ROOT/generated"
         clone_path "$MAGENTO_DIR/$entry" "$BUILD_ROOT/$entry" \
             || die "Failed to clone $entry into the build directory"
-    done
+    done < <(list_generated_entries "$MAGENTO_DIR")
 }
 
 # Export a git tree with the shell pipeline hidden from run_cmd
@@ -1758,8 +1772,12 @@ di_compile() {
     if ! run_cmd --retries 2 --label "setup:di:compile" -- magento_cli_in "$BUILD_ROOT" setup:di:compile; then
         die "DI compilation failed"
     fi
-    if [[ "$DRY_RUN" != "true" ]] && [[ ! -d "$BUILD_ROOT/generated/code" || ! -d "$BUILD_ROOT/generated/metadata" ]]; then
-        die "setup:di:compile finished but generated/code or generated/metadata is missing in the build"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        [[ -d "$BUILD_ROOT/generated/code" ]] \
+            || die "setup:di:compile finished but generated/code is missing in the build"
+        if [[ ! -d "$BUILD_ROOT/generated/metadata" ]]; then
+            ui_note "no generated/metadata produced (an alternative DI compiler such as creatuity/magento2-interceptors is in use)"
+        fi
     fi
     record_step_time "DI compilation" $(( SECONDS - start ))
 }
@@ -1961,7 +1979,7 @@ import_artifacts() {
     mkdir -p "$BUILD_ROOT/pub" "$BUILD_ROOT/generated"
     local entry
     if [[ "$SKIP_DI_COMPILE" != "true" ]]; then
-        for entry in generated/code generated/metadata vendor/composer vendor/autoload.php; do
+        for entry in $(list_generated_entries "$ARTIFACTS_DIR") vendor/composer vendor/autoload.php; do
             [[ -e "$ARTIFACTS_DIR/$entry" ]] || continue
             mkdir -p "$BUILD_ROOT/$(dirname "$entry")"
             clone_path "$ARTIFACTS_DIR/$entry" "$BUILD_ROOT/$entry" || die "Failed to stage $entry"
@@ -2071,9 +2089,21 @@ swap_artifacts() {
     local start=$SECONDS
     local items=() entry name
 
+    local retire=()
     if [[ "$SKIP_DI_COMPILE" != "true" ]]; then
-        # classmap and generated code must switch together
-        items+=(generated/code generated/metadata vendor/composer vendor/autoload.php)
+        # classmap and generated code must switch together; every entry the
+        # compiler produced goes live, entries it did not produce are retired
+        if [[ "$DRY_RUN" == "true" ]]; then
+            items+=("generated/*")
+        else
+            while IFS= read -r entry; do
+                [[ -n "$entry" ]] && items+=("$entry")
+            done < <(list_generated_entries "$BUILD_ROOT")
+            while IFS= read -r entry; do
+                [[ -n "$entry" && ! -e "$BUILD_ROOT/$entry" ]] && retire+=("$entry")
+            done < <(list_generated_entries "$MAGENTO_DIR")
+        fi
+        items+=(vendor/composer vendor/autoload.php)
     fi
     if [[ "$SKIP_STATIC" != "true" ]]; then
         items+=(var/view_preprocessed)
@@ -2110,7 +2140,7 @@ swap_artifacts() {
     for entry in "${items[@]}"; do
         swap_item "$entry"
     done
-    for entry in ${RETIRE_CODE_ITEMS[@]+"${RETIRE_CODE_ITEMS[@]}"}; do
+    for entry in ${RETIRE_CODE_ITEMS[@]+"${RETIRE_CODE_ITEMS[@]}"} ${retire[@]+"${retire[@]}"}; do
         retire_item "$entry"
         SWAPPED_ITEMS+=("-$entry")
     done
@@ -2191,7 +2221,7 @@ post_deployment_checks() {
     CURRENT_STEP="Post-deployment checks"
     local start=$SECONDS warnings=0 dir count
 
-    for dir in generated/code generated/metadata pub/static; do
+    for dir in generated/code pub/static; do
         if [[ -d "$MAGENTO_DIR/$dir" ]]; then
             count="$(find "$MAGENTO_DIR/$dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
             ui_note "$dir: $count files"
@@ -2274,7 +2304,7 @@ push_artifacts() {
 
     local incoming="$remote_dir/var/deploy/incoming"
     local paths=() rel
-    for rel in generated/code generated/metadata vendor/composer pub/static var/view_preprocessed; do
+    for rel in generated vendor/composer pub/static var/view_preprocessed; do
         [[ -e "$BUILD_ROOT/$rel" ]] && paths+=("$rel")
     done
     if [[ -f "$BUILD_ROOT/vendor/autoload.php" ]]; then
@@ -2844,7 +2874,7 @@ main() {
         local build_duration=$(( SECONDS - DEPLOYMENT_START_TIME ))
         generate_report "SUCCESS" "$build_duration"
         display_summary "SUCCESS" "$build_duration"
-        [[ "$DRY_RUN" != "true" ]] && ui_kv "Artifacts" "$BUILD_ROOT (generated/, vendor/composer/, vendor/autoload.php, pub/static/, var/view_preprocessed/)"
+        [[ "$DRY_RUN" != "true" ]] && ui_kv "Artifacts" "$BUILD_ROOT (generated/*, vendor/composer/, vendor/autoload.php, pub/static/, var/view_preprocessed/)"
         _file_log OK "Build completed in $(format_duration "$build_duration")"
         exit 0
     fi

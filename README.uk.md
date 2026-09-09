@@ -198,7 +198,7 @@ Hardlink ділить inode із живим файлом, тому все, що 
 
 З `--skip-di-compile`, але з увімкненою статикою, живі `generated/code` і `generated/metadata` клонуються всередину, щоб статика деплоїлась проти скомпільованого коду.
 
-**Компіляція.** `setup:di:compile` виконується в клоні з однією повторною спробою. Зауважте: компілятор Magento на старті очищує налаштований кеш-бекенд (включно з Redis) так само, як і при класичному деплої.
+**Компіляція.** `setup:di:compile` виконується в клоні з однією повторною спробою. Зауважте: компілятор Magento на старті очищує налаштований кеш-бекенд (включно з Redis) так само, як і при класичному деплої. Усе, що компілятор залишає в `generated/`, вважається результатом: `generated/code` обов'язковий, `generated/metadata` необов'язковий, а додаткові каталоги на кшталт `generated/staticcache`, які пишуть альтернативні компілятори (наприклад `creatuity/magento2-interceptors`, що взагалі не створює `metadata`), підхоплюються автоматично.
 
 **Оптимізований автозавантажувач.** `composer dump-autoload --optimize --apcu --no-plugins --working-dir=<клон>` будує classmap проти щойно згенерованого коду. Результат (`vendor/composer/`, `vendor/autoload.php`) свапається разом із `generated/` у фазі release. `--apcu` безпечний без розширення; `--no-plugins` не повторює побічні дії плагінів, які вже відбулися під час живого `composer install`.
 
@@ -221,7 +221,7 @@ php -d memory_limit=-1 var/deploy/build/bin/magento setup:static-content:deploy 
 2. **Maintenance-режим** вмикається лише коли буде `setup:upgrade` (`MAINTENANCE=auto`) або при `MAINTENANCE=always`. `MAINTENANCE_ALLOWED_IPS` передаються як опції `--ip`.
 3. **Своп.** Для кожного елемента живий переміщується у `var/deploy/previous/<шлях>`, а зібраний — на його місце:
    - у git-режимі спершу код: `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json`, `composer.lock`, усі інші відстежувані елементи верхнього рівня і `pub/*`, крім `media` та `static`; відстежувані елементи, вилучені новим комітом, прибираються;
-   - `generated/code`, `generated/metadata`, `vendor/composer`, `vendor/autoload.php` (якщо компілювали);
+   - кожен елемент `generated/` з build, крім `.htaccess` (`code`, `metadata`, `staticcache`, ...), `vendor/composer`, `vendor/autoload.php` (якщо компілювали); живі елементи `generated/`, яких нова компіляція не створила, прибираються, тож застарілий `metadata` не переживе перехід на інший компілятор;
    - `var/view_preprocessed` і кожен елемент `pub/static/` клона, крім `.htaccess` — зазвичай `frontend`, `adminhtml`, `deployed_version.txt` (якщо деплоїли статику);
    - `pub/static/_cache` (злиті/мініфіковані бандли зі старих джерел) прибирається, він відновлюється на вимогу.
    Кожен своп — це два перейменування; проміжок між ними — мікросекунди. Якщо друге перейменування не вдалося, попередня версія повертається негайно. `.htaccess`, `pagespeed_cache` та інші власні елементи в `pub/static` залишаються на місці. У git-режимі живий `.git` потім переводиться на задеплоєний коміт через `git reset --mixed <коміт>`: оновлюються `HEAD`, гілка та індекс, але у робоче дерево нічого не пишеться (воно вже збігається).
@@ -304,7 +304,7 @@ Maintenance-режим навмисно **не** вимикається авто
 
 ## Pipeline-режим: зібрати один раз, викотити в іншому місці
 
-Фаза build створює звичайні файли: `generated/`, `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. Жоден із них не містить абсолютних шляхів, тож їх можна зібрати на робочій станції чи CI-раннері й викотити на сервері.
+Фаза build створює звичайні файли: `generated/` (увесь), `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. Жоден із них не містить абсолютних шляхів, тож їх можна зібрати на робочій станції чи CI-раннері й викотити на сервері.
 
 ```bash
 # на машині збірки (той самий коміт, той самий composer.lock, той самий app/etc/config.php)

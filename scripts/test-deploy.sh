@@ -96,9 +96,13 @@ case "$cmd" in
             echo "Compilation failed with errors"
             exit 1
         fi
-        mkdir -p "$ROOT/generated/code/Fake" "$ROOT/generated/metadata"
+        mkdir -p "$ROOT/generated/code/Fake" "$ROOT/generated/staticcache"
         echo "<?php // compiled in $ROOT" > "$ROOT/generated/code/Fake/Interceptor.php"
-        echo "<?php return [];" > "$ROOT/generated/metadata/global.php"
+        echo "<?php // plugin list" > "$ROOT/generated/staticcache/global_primary_compiled_plugins.php"
+        if [[ -z "${FAKE_NO_METADATA:-}" ]]; then
+            mkdir -p "$ROOT/generated/metadata"
+            echo "<?php return [];" > "$ROOT/generated/metadata/global.php"
+        fi
         echo "Generated code and dependency injection configuration successfully."
         ;;
     setup:static-content:deploy)
@@ -231,13 +235,14 @@ setup_sandbox() {
     echo '{}' > "$SANDBOX/composer.lock"
     echo "version1" > "$SANDBOX/pub/static/deployed_version.txt"
     echo ".htaccess" > "$SANDBOX/pub/static/.htaccess"
+    echo "deny" > "$SANDBOX/generated/.htaccess"
     touch "$SANDBOX/generated/code/Old/f.php" "$SANDBOX/generated/metadata/old.php" \
         "$SANDBOX/pub/static/frontend/x/f.css" "$SANDBOX/pub/static/_cache/merged/old.css" \
         "$SANDBOX/var/view_preprocessed/old.less" "$SANDBOX/pub/media/catalog/img.jpg" \
         "$SANDBOX/vendor/magento/x/f.php"
     seed_fingerprint
     : > "$FAKE_LOG_FILE"
-    unset FAKE_MODE FAKE_DB_STATUS FAKE_CONFIG_STATUS FAKE_FAIL_DI FAKE_FAIL_SCD FAKE_FAIL_UPGRADE \
+    unset FAKE_MODE FAKE_DB_STATUS FAKE_CONFIG_STATUS FAKE_FAIL_DI FAKE_FAIL_SCD FAKE_FAIL_UPGRADE FAKE_NO_METADATA \
         FAKE_HTTP_CODE FAKE_SCD_SLEEP MAINTENANCE MAINTENANCE_ALLOWED_IPS DB_UPGRADE PRE_DEPLOY_CMD \
         POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
         DB_BACKUP DB_BACKUP_CMD SCD_EXTRA_ARGS KEEP_PREVIOUS 2>/dev/null
@@ -337,6 +342,8 @@ assert_exists "$SANDBOX/pub/static/.htaccess" "pub/static/.htaccess preserved"
 assert_exists "$SANDBOX/generated/code/Fake/Interceptor.php" "new generated code live"
 assert_missing "$SANDBOX/generated/code/Old/f.php" "old generated code replaced"
 assert_exists "$SANDBOX/generated/metadata/global.php" "new metadata live"
+assert_exists "$SANDBOX/generated/staticcache/global_primary_compiled_plugins.php" "extra compiler output (staticcache) live"
+assert_exists "$SANDBOX/generated/.htaccess" "generated/.htaccess preserved"
 assert_exists "$SANDBOX/vendor/magento/x/f.php" "vendor packages untouched"
 assert_missing "$SANDBOX/var/view_preprocessed/old.less" "old view_preprocessed replaced"
 assert_exists "$SANDBOX/pub/media/catalog/img.jpg" "media untouched"
@@ -701,6 +708,7 @@ assert_not_grep "$FAKE_LOG_FILE" "static-content:deploy" "no static deploy"
 assert_exists "$SANDBOX/generated/code/Fake/Interceptor.php" "pre-built generated code live"
 assert_exists "$SANDBOX/pub/static/frontend/Vendor/beta/de_DE/css/styles.css" "pre-built static content live"
 assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "dumped in" "pre-built classmap live"
+assert_exists "$SANDBOX/generated/staticcache/global_primary_compiled_plugins.php" "pre-built staticcache live"
 assert_exists "$ARTIFACTS/pub/static/deployed_version.txt" "artifacts source left intact"
 assert_grep "$FAKE_LOG_FILE" "cache:flush" "release still flushes caches"
 setup_sandbox
@@ -713,7 +721,7 @@ run_deploy --push www@shop.example.test:/var/www/html --push-run
 assert_exit $RC 0 "push deploy exits 0"
 assert_grep "$OUT" "BUILD COMPLETE" "push implies build-only"
 assert_grep "$FAKE_LOG_FILE" "SSH www@shop.example.test mkdir -p '/var/www/html/var/deploy/incoming'" "incoming dir created on server"
-assert_grep "$FAKE_LOG_FILE" "RSYNC -az --delete -e ssh .*var/deploy/build/generated/code/ www@shop.example.test:/var/www/html/var/deploy/incoming/generated/code/" "generated code uploaded"
+assert_grep "$FAKE_LOG_FILE" "RSYNC -az --delete -e ssh .*var/deploy/build/generated/ www@shop.example.test:/var/www/html/var/deploy/incoming/generated/" "generated/ uploaded"
 assert_grep "$FAKE_LOG_FILE" "RSYNC .*pub/static/ www@shop.example.test:/var/www/html/var/deploy/incoming/pub/static/" "static content uploaded"
 assert_grep "$FAKE_LOG_FILE" "RSYNC .*vendor/composer/ www@shop.example.test:/var/www/html/var/deploy/incoming/vendor/composer/" "classmap uploaded"
 assert_grep "$FAKE_LOG_FILE" "RSYNC .*vendor/autoload.php www@shop.example.test:/var/www/html/var/deploy/incoming/vendor/autoload.php" "vendor/autoload.php uploaded"
@@ -722,6 +730,17 @@ assert_not_grep "$FAKE_LOG_FILE" "cache:flush" "no local release"
 setup_sandbox
 run_deploy --push not-a-target
 assert_exit $RC 1 "malformed push target rejected"
+
+echo "=== T30b2: DI compiler without generated/metadata (creatuity interceptors) ==="
+setup_sandbox
+export FAKE_NO_METADATA=1
+run_deploy
+assert_exit $RC 0 "deploy without metadata exits 0"
+assert_grep "$OUT" "no generated/metadata produced" "explains the missing metadata"
+assert_exists "$SANDBOX/generated/staticcache/global_primary_compiled_plugins.php" "staticcache live"
+assert_missing "$SANDBOX/generated/metadata" "stale live metadata retired"
+assert_grep "$OUT" "\-generated/metadata" "retired entry reported"
+unset FAKE_NO_METADATA
 
 echo "=== T30c: leftover var/.regenerate is cleared before the first live bin/magento call ==="
 setup_sandbox

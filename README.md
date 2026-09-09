@@ -198,7 +198,7 @@ The clone gets fresh, empty `generated/`, `var/` and `pub/static/`, and `pub/med
 
 With `--skip-di-compile` but static deployment enabled, the live `generated/code` and `generated/metadata` are cloned in so static content is deployed against compiled code.
 
-**Compile.** `setup:di:compile` runs in the clone, with one retry. Note that Magento's compiler cleans the configured cache backend at start (Redis included) exactly as it would in a classic deployment.
+**Compile.** `setup:di:compile` runs in the clone, with one retry. Note that Magento's compiler cleans the configured cache backend at start (Redis included) exactly as it would in a classic deployment. Whatever the compiler leaves under `generated/` is treated as the result: `generated/code` is required, `generated/metadata` is optional, and additional directories such as `generated/staticcache` written by alternative compilers (for example `creatuity/magento2-interceptors`, which produces no `metadata` at all) are picked up automatically.
 
 **Optimized autoloader.** `composer dump-autoload --optimize --apcu --no-plugins --working-dir=<clone>` builds the classmap against the freshly generated code. The result (`vendor/composer/`, `vendor/autoload.php`) is swapped into place together with `generated/` in the release phase. `--apcu` is harmless without the extension; `--no-plugins` avoids repeating plugin side effects that already happened during the live `composer install`.
 
@@ -221,7 +221,7 @@ The phase header says whether a maintenance window will be used and why.
 2. **Maintenance mode** is enabled only when `setup:upgrade` will run (`MAINTENANCE=auto`) or when `MAINTENANCE=always`. `MAINTENANCE_ALLOWED_IPS` are passed as `--ip` options.
 3. **Swap.** For every entry the live one is moved to `var/deploy/previous/<path>` and the built one is moved into place:
    - in git mode first the code: `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json`, `composer.lock`, every other tracked top-level entry, and `pub/*` except `media` and `static`; tracked entries removed by the new commit are retired;
-   - `generated/code`, `generated/metadata`, `vendor/composer`, `vendor/autoload.php` (when compiled);
+   - every entry under the build's `generated/` except `.htaccess` (`code`, `metadata`, `staticcache`, ...), `vendor/composer`, `vendor/autoload.php` (when compiled); live entries under `generated/` that the new compile did not produce are retired, so a stale `metadata` cannot survive a switch to another compiler;
    - `var/view_preprocessed` and every entry of the clone's `pub/static/` except `.htaccess` — normally `frontend`, `adminhtml`, `deployed_version.txt` (when static content was deployed);
    - `pub/static/_cache` (merged/minified bundles built from the old sources) is retired, it is regenerated on demand.
    Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
@@ -304,7 +304,7 @@ The lock is released on every exit path, so the next run never has to remove a s
 
 ## Pipeline mode: build once, release elsewhere
 
-The build phase produces plain files: `generated/`, `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. None of them contain absolute paths, so they can be built on a workstation or CI runner and released on the server.
+The build phase produces plain files: `generated/` (all of it), `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. None of them contain absolute paths, so they can be built on a workstation or CI runner and released on the server.
 
 ```bash
 # on the build machine (same commit, same composer.lock, same app/etc/config.php)
