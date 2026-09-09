@@ -7,7 +7,11 @@
 # root (or any directory with --dir / MAGENTO_DIR).
 #
 # How it stays online:
-#   * composer install runs in place while the site serves traffic.
+#   * With --ref/--git the code itself comes from git: the ref is exported
+#     into the build clone (git fetch touches only .git), composer install
+#     runs there, and the code directories are swapped together with the
+#     artifacts. Without a ref the code is expected to be in place already
+#     and composer install runs live.
 #   * setup:di:compile, the optimized composer classmap and
 #     setup:static-content:deploy run inside a throw-away build clone of
 #     the code tree (var/deploy/build), so the live generated/ and
@@ -27,7 +31,8 @@
 # Pipeline:
 #   1. Preflight       validate config, PHP, composer, disk, memory, lock
 #   2. Pre-deploy hook PRE_DEPLOY_CMD
-#   3. Composer        composer install (live, plain autoloader)
+#   2b. Source         (git mode) fetch + export GIT_REF into the build
+#   3. Composer        composer install (live, or in the build in git mode)
 #   4. Database check  setup:db:status, app:config:status, db fingerprint
 #                      app:config:import runs here (live) when pending
 #   5. Build           clone -> setup:di:compile -> dump-autoload -o
@@ -42,7 +47,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.0.0"
+DEPLOY_VERSION="3.1.0"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -167,6 +172,9 @@ PARALLEL_JOBS="${PARALLEL_JOBS:-}"
 SCD_EXTRA_ARGS="${SCD_EXTRA_ARGS:-}"
 BUILD_DIR="${BUILD_DIR:-}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-}"
+GIT_REF="${GIT_REF:-}"
+GIT_REMOTE="${GIT_REMOTE:-origin}"
+BUILD_COPY_VENDOR="${BUILD_COPY_VENDOR:-false}"
 BUILD_ONLY="${BUILD_ONLY:-false}"
 PUSH_TARGET="${PUSH_TARGET:-}"
 PUSH_RUN="${PUSH_RUN:-false}"
@@ -242,6 +250,12 @@ CONFIG_IMPORT_NEEDED=false
 DB_FINGERPRINT=""
 ARTIFACTS_SWAPPED=false
 COMPOSER_RAN=false
+GIT_MODE=false
+GIT_SHA=""
+GIT_PREVIOUS_SHA=""
+SWAP_CODE_ITEMS=()
+RETIRE_CODE_ITEMS=()
+MAGENTO_CLI_ROOT=""
 BUILD_ROOT=""
 PREVIOUS_DIR=""
 DEPLOY_STATE_DIR=""
@@ -516,7 +530,7 @@ trap 'exit 143' TERM
 # bin/magento of the live installation (or of the build clone when a
 # root is given as first argument via magento_cli_in)
 magento_cli() {
-    magento_cli_in "$MAGENTO_DIR" "$@"
+    magento_cli_in "${MAGENTO_CLI_ROOT:-$MAGENTO_DIR}" "$@"
 }
 
 magento_cli_in() {
@@ -680,7 +694,10 @@ USAGE:
 PIPELINE:
     1. Preflight        validate config, PHP, composer, disk, memory, lock
     2. Pre-deploy hook  PRE_DEPLOY_CMD (abort on failure)
-    3. Composer         composer install (site live, plain autoloader)
+    2b. Source          --ref/--git only: git fetch, export the ref into the
+                        build clone; the live checkout is not touched
+    3. Composer         composer install (site live; inside the build in
+                        git mode), plain autoloader
     4. Database check   setup:db:status + app:config:status + a fingerprint
                         of db_schema.xml / module.xml / Setup files.
                         app:config:import runs here (live) when pending.
@@ -690,8 +707,9 @@ PIPELINE:
                         setup:static-content:deploy run there - one (theme,
                         locale) process per CPU core - while the site keeps
                         serving the old assets
-    6. Release          artifacts are swapped into place with directory
-                        renames; setup:upgrade runs ONLY when database
+    6. Release          artifacts (and in git mode the code directories)
+                        are swapped into place with directory renames;
+                        setup:upgrade runs ONLY when database
                         changes were detected and ONLY then maintenance
                         mode is enabled; cache:flush; OPcache reset
     7. Verify           health check, post-deployment checks, POST_DEPLOY_CMD
@@ -704,6 +722,9 @@ OPTIONS:
     -p, --php PATH          PHP binary (default: php)
     -c, --composer PATH     Composer binary (default: composer)
     -j, --jobs NUM          Parallel static-content processes (default: CPU cores)
+    --ref REF               Git mode: deploy this branch/tag/commit (e.g.
+                            origin/main, v1.4.2, a1b2c3d). See GIT MODE.
+    --git                   Git mode using the current branch's upstream
     --db-upgrade MODE       auto (default), always, never - see DATABASE
     --maintenance MODE      auto (default), always, never - see MAINTENANCE
     --memory-limit LIMIT    PHP memory_limit for CLI commands (default: -1)
@@ -731,6 +752,22 @@ OPTIONS:
     --backend-theme T       Backend theme (default: Magento/backend)
     --frontend-langs L      Frontend locales, space/comma separated (default: en_GB)
     --backend-langs L       Backend locales, space/comma separated (default: en_US)
+
+GIT MODE (--ref / --git / GIT_REF):
+    Without a ref the code must already be in place (git pull done by you
+    or PRE_DEPLOY_CMD) and composer install runs live - the site then runs
+    new code with the old generated code until the swap.
+    With a ref the live checkout is never modified before the swap:
+      git fetch GIT_REMOTE  ->  git archive REF into var/deploy/build
+      live vendor/ is merged in (hardlinks), env.php and untracked files
+      inside the swapped directories are carried over, composer install,
+      setup:di:compile and static content run in the build, and the
+      release renames app/ lib/ setup/ bin/ vendor/ pub/* (except media
+      and static) together with generated/ and pub/static/. Afterwards
+      the live .git is moved to the deployed commit (git reset --mixed,
+      no working tree writes). Tracked entries removed by the new commit
+      are retired, pub/media and var/ are never touched.
+    BUILD_COPY_VENDOR=true copies vendor/ instead of hardlinking it.
 
 DATABASE (DB_UPGRADE):
     auto    setup:upgrade runs when setup:db:status reports pending changes
@@ -785,7 +822,8 @@ ENVIRONMENT VARIABLES:
     DEPLOY_CONFIG, MAGENTO_DIR, PHP_BIN, COMPOSER_BIN, PHP_MEMORY_LIMIT,
     PARALLEL_JOBS, FRONTEND_THEMES, BACKEND_THEME, FRONTEND_LANGUAGES,
     BACKEND_LANGUAGES, DB_UPGRADE, MAINTENANCE, MAINTENANCE_ALLOWED_IPS,
-    SCD_EXTRA_ARGS, BUILD_DIR, ARTIFACTS_DIR, BUILD_ONLY, KEEP_PREVIOUS, SKIP_COMPOSER, SKIP_DB_CHECK,
+    GIT_REF, GIT_REMOTE, BUILD_COPY_VENDOR, SCD_EXTRA_ARGS, BUILD_DIR,
+    ARTIFACTS_DIR, BUILD_ONLY, KEEP_PREVIOUS, SKIP_COMPOSER, SKIP_DB_CHECK,
     SKIP_STATIC, SKIP_DI_COMPILE, VERBOSE, DRY_RUN, NO_INTERACTION,
     DEPLOY_ASCII, NO_COLOR, LOG_FILE, LOG_RETENTION_DAYS, PRE_DEPLOY_CMD,
     POST_DEPLOY_CMD, OPCACHE_RESET_CMD, HEALTHCHECK_URL,
@@ -793,7 +831,9 @@ ENVIRONMENT VARIABLES:
 
 EXAMPLES:
     deploy.sh --init                          # Generate .deploy.env
-    deploy.sh                                 # Full zero-downtime deploy
+    deploy.sh                                 # Full zero-downtime deploy (code in place)
+    deploy.sh --ref origin/main               # Fetch + deploy a ref, live tree untouched until swap
+    deploy.sh --git                           # Same, using the current branch's upstream
     deploy.sh --dry-run                       # Preview
     deploy.sh -j 16 -v                        # 16 static-content processes, verbose
     deploy.sh --skip-static --skip-di-compile # Code-only deploy
@@ -825,6 +865,8 @@ parse_arguments() {
             -p|--php)           _require_value "$1" $#; PHP_BIN="$2"; shift 2 ;;
             -c|--composer)      _require_value "$1" $#; COMPOSER_BIN="$2"; shift 2 ;;
             -j|--jobs)          _require_value "$1" $#; PARALLEL_JOBS="$2"; shift 2 ;;
+            --ref)              _require_value "$1" $#; GIT_REF="$2"; shift 2 ;;
+            --git)              GIT_REF='@{upstream}'; shift ;;
             --db-upgrade)       _require_value "$1" $#; DB_UPGRADE="$2"; shift 2 ;;
             --maintenance)      _require_value "$1" $#; MAINTENANCE="$2"; shift 2 ;;
             --memory-limit)     _require_value "$1" $#; PHP_MEMORY_LIMIT="$2"; shift 2 ;;
@@ -995,6 +1037,23 @@ validate_configuration() {
     fi
     if (( ${#FRONTEND_THEMES[@]} == 0 )); then
         ui_warn "No frontend themes configured - frontend static content will be skipped"
+    fi
+    if [[ -n "$GIT_REF" ]]; then
+        GIT_MODE=true
+        if ! command -v git >/dev/null 2>&1; then
+            ui_fail "git mode (--ref) requires git"
+            (( errors++ ))
+        elif [[ ! -e "$MAGENTO_DIR/.git" ]]; then
+            ui_fail "git mode (--ref) requires $MAGENTO_DIR to be a git checkout"
+            (( errors++ ))
+        elif ! command -v tar >/dev/null 2>&1; then
+            ui_fail "git mode (--ref) requires tar"
+            (( errors++ ))
+        fi
+        if [[ -n "$ARTIFACTS_DIR" ]]; then
+            ui_fail "--ref and --artifacts cannot be combined"
+            (( errors++ ))
+        fi
     fi
     if [[ -n "$ARTIFACTS_DIR" ]]; then
         if [[ "$BUILD_ONLY" == "true" ]]; then
@@ -1240,18 +1299,26 @@ backup_database() {
 # PHASE: Composer (site live)
 # ───────────────────────────────────────────────────────────────────
 composer_phase() {
-    ui_phase "Composer" "site live"
+    local root="$MAGENTO_DIR"
+    if [[ "$GIT_MODE" == "true" ]]; then
+        root="$BUILD_ROOT"
+        ui_phase "Composer" "inside the build, live tree untouched"
+    else
+        ui_phase "Composer" "site live"
+    fi
     local start=$SECONDS
 
     if [[ "$SKIP_COMPOSER" == "true" ]]; then
         ui_skip "composer install" "(--skip-composer)"
+    elif [[ "$DRY_RUN" == "true" && "$GIT_MODE" == "true" ]]; then
+        ui_dry "composer install --no-dev --working-dir=$(rel_path "$root")"
     else
-        if [[ ! -f "$MAGENTO_DIR/composer.lock" ]]; then
-            die "composer.lock not found in $MAGENTO_DIR - deployments must install from a lock file"
+        if [[ ! -f "$root/composer.lock" ]]; then
+            die "composer.lock not found in $root - deployments must install from a lock file"
         fi
-        COMPOSER_RAN=true
+        [[ "$GIT_MODE" != "true" ]] && COMPOSER_RAN=true
         if ! run_cmd --label "composer install --no-dev" -- \
-            composer_cli install --no-dev --no-interaction --no-progress --prefer-dist --working-dir="$MAGENTO_DIR"; then
+            composer_cli install --no-dev --no-interaction --no-progress --prefer-dist --working-dir="$root"; then
             die "Composer install failed"
         fi
     fi
@@ -1289,17 +1356,18 @@ clear_regenerate_flag() {
 # A fingerprint of the schema/patch related files closes that gap.
 # ───────────────────────────────────────────────────────────────────
 compute_db_fingerprint() {
+    local root="${1:-$MAGENTO_DIR}"
     local dirs=() d
     for d in app/code vendor; do
-        [[ -d "$MAGENTO_DIR/$d" ]] && dirs+=("$d")
+        [[ -d "$root/$d" ]] && dirs+=("$d")
     done
     {
         if (( ${#dirs[@]} > 0 )); then
-            ( cd "$MAGENTO_DIR" && find "${dirs[@]}" -type f \
+            ( cd "$root" && find "${dirs[@]}" -type f \
                 \( -name db_schema.xml -o -name db_schema_whitelist.json -o -name module.xml -o -path '*/Setup/*.php' \) \
                 -print0 2>/dev/null | LC_ALL=C sort -z | xargs -0 cksum 2>/dev/null )
         fi
-        [[ -f "$MAGENTO_DIR/app/etc/config.php" ]] && ( cd "$MAGENTO_DIR" && cksum app/etc/config.php )
+        [[ -f "$root/app/etc/config.php" ]] && ( cd "$root" && cksum app/etc/config.php )
     } | cksum | awk '{print $1}'
 }
 
@@ -1310,13 +1378,21 @@ save_db_fingerprint() {
 }
 
 database_check_phase() {
-    ui_phase "Database check"
+    local root="$MAGENTO_DIR"
+    if [[ "$GIT_MODE" == "true" ]]; then
+        root="$BUILD_ROOT"
+        ui_phase "Database check" "against the new code in the build"
+    else
+        ui_phase "Database check"
+    fi
     local start=$SECONDS
+    MAGENTO_CLI_ROOT="$root"
 
     clear_regenerate_flag
 
     if [[ "$SKIP_DB_CHECK" == "true" ]]; then
         ui_skip "setup:db:status / app:config:status / setup:upgrade" "(--skip-db-check)"
+        MAGENTO_CLI_ROOT="$MAGENTO_DIR"
         record_step_time "Database check" $(( SECONDS - start ))
         return 0
     fi
@@ -1349,7 +1425,7 @@ database_check_phase() {
 
     # 2. Fingerprint of schema / patch related files
     local stored=""
-    DB_FINGERPRINT="$(compute_db_fingerprint)"
+    DB_FINGERPRINT="$(compute_db_fingerprint "$root")"
     [[ -f "$DEPLOY_STATE_DIR/db-fingerprint" ]] && stored="$(head -1 "$DEPLOY_STATE_DIR/db-fingerprint")"
     if [[ -z "$stored" ]]; then
         if [[ "$DB_UPGRADE_NEEDED" != "true" ]]; then
@@ -1397,6 +1473,7 @@ database_check_phase() {
         fi
     fi
 
+    MAGENTO_CLI_ROOT="$MAGENTO_DIR"
     record_step_time "Database check" $(( SECONDS - start ))
 }
 
@@ -1446,6 +1523,20 @@ clone_path() {
     esac
 }
 
+# Merge the contents of a live directory into an existing build directory
+# without overwriting files that are already there (git-tracked files win)
+clone_merge() {
+    local src="$1" dst="$2"
+    mkdir -p "$dst"
+    if [[ "$BUILD_COPY_VENDOR" == "true" ]]; then
+        cp -Rpn "$src/." "$dst/" 2>/dev/null; CLONE_MODE="copy"; return 0
+    fi
+    if cp -aln "$src/." "$dst/" 2>/dev/null; then CLONE_MODE="hardlink"; return 0; fi
+    if [[ "$PLATFORM" == "Darwin" ]] && cp -Rpcn "$src/." "$dst/" 2>/dev/null; then CLONE_MODE="apfs-clone"; return 0; fi
+    cp -Rpn "$src/." "$dst/" 2>/dev/null; CLONE_MODE="copy"
+    return 0
+}
+
 # Replace a cloned file with a private copy so writes cannot reach the
 # live file through a shared inode
 detach_file() {
@@ -1461,6 +1552,159 @@ detach_dir() {
     [[ -d "$BUILD_ROOT/$rel" ]] || return 0
     local tmp="$BUILD_ROOT/$rel.detach.$$"
     cp -Rp "$BUILD_ROOT/$rel" "$tmp" && rm -rf "${BUILD_ROOT:?}/${rel:?}" && mv "$tmp" "$BUILD_ROOT/$rel"
+}
+
+# Copy the live generated code into the build (kept with --skip-di-compile)
+import_live_generated() {
+    local entry
+    for entry in generated/code generated/metadata; do
+        [[ -d "$MAGENTO_DIR/$entry" ]] || continue
+        [[ -e "$BUILD_ROOT/$entry" ]] && rm -rf "${BUILD_ROOT:?}/$entry"
+        mkdir -p "$BUILD_ROOT/generated"
+        clone_path "$MAGENTO_DIR/$entry" "$BUILD_ROOT/$entry" \
+            || die "Failed to clone $entry into the build directory"
+    done
+}
+
+# Export a git tree with the shell pipeline hidden from run_cmd
+git_export_tree() {
+    ( cd "$MAGENTO_DIR" && git archive --format=tar "$1" ) | tar -x -C "$2"
+}
+
+# Carry untracked/ignored files that live inside directories the release
+# will swap (env.php, pub/errors/local.xml, ...) into the build
+carry_untracked_files() {
+    local paths=() rel
+    for rel in ${SWAP_CODE_ITEMS[@]+"${SWAP_CODE_ITEMS[@]}"}; do
+        [[ "$rel" == "vendor" ]] && continue
+        paths+=("$rel")
+    done
+    (( ${#paths[@]} > 0 )) || return 0
+    local list
+    list="$(mktemp)" || die "Failed to create temporary file"
+    (
+        cd "$MAGENTO_DIR" || exit 1
+        git ls-files --others --exclude-standard -z -- "${paths[@]}"
+        git ls-files --others --exclude-standard -i -z -- "${paths[@]}"
+    ) > "$list" 2>/dev/null
+    local count
+    count="$(tr -cd '\0' < "$list" | wc -c | tr -d ' ')"
+    if (( count > 0 )); then
+        ( cd "$MAGENTO_DIR" && tar -c --null -T "$list" -f - ) | tar -x -C "$BUILD_ROOT" \
+            || { rm -f "$list"; die "Failed to carry untracked files into the build"; }
+        ui_note "carried over $count untracked/ignored file(s) from the live tree (env.php, local configs, ...)"
+    fi
+    rm -f "$list"
+}
+
+# Which top-level entries will be swapped in git mode: every tracked
+# top-level entry of the new commit except runtime data, plus pub/*
+# except media and static. Tracked entries that disappeared are retired.
+plan_code_swap() {
+    SWAP_CODE_ITEMS=()
+    RETIRE_CODE_ITEMS=()
+    local entry self
+    self="$(basename "${BASH_SOURCE[0]}")"
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        case "$entry" in
+            .git|.gitignore|.gitattributes|.gitmodules|var|generated|pub|"$self"|.deploy.env) continue ;;
+        esac
+        SWAP_CODE_ITEMS+=("$entry")
+    done < <(cd "$MAGENTO_DIR" && git ls-tree --name-only "$GIT_SHA" 2>/dev/null)
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        case "$entry" in
+            pub/media|pub/static) continue ;;
+        esac
+        SWAP_CODE_ITEMS+=("$entry")
+    done < <(cd "$MAGENTO_DIR" && git ls-tree --name-only "$GIT_SHA" pub/ 2>/dev/null)
+
+    # entries tracked by the current commit but gone in the new one
+    local old
+    for old in $(cd "$MAGENTO_DIR" && { git ls-tree --name-only "$GIT_PREVIOUS_SHA"; git ls-tree --name-only "$GIT_PREVIOUS_SHA" pub/; } 2>/dev/null); do
+        case "$old" in .git*|var|generated|pub|pub/media|pub/static|"$self"|.deploy.env) continue ;; esac
+        ( cd "$MAGENTO_DIR" && git cat-file -e "$GIT_SHA:$old" 2>/dev/null ) && continue
+        RETIRE_CODE_ITEMS+=("$old")
+    done
+    return 0
+}
+
+source_phase() {
+    [[ "$GIT_MODE" == "true" ]] || return 0
+    ui_phase "Source" "git $GIT_REF from $GIT_REMOTE"
+    CURRENT_STEP="Exporting source from git"
+    local start=$SECONDS
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # A fetch only updates remote-tracking refs inside .git; without it
+        # the dry run would plan against a stale ref
+        if git -C "$MAGENTO_DIR" fetch --quiet --prune --tags "$GIT_REMOTE" 2>>"$LOG_FILE"; then
+            ui_note "git fetch $GIT_REMOTE executed (dry run still fetches: it only updates refs inside .git)"
+        else
+            ui_warn "git fetch $GIT_REMOTE failed - planning against the refs already present"
+        fi
+    elif ! run_cmd --label "git fetch --prune --tags $GIT_REMOTE" -- \
+        git -C "$MAGENTO_DIR" fetch --quiet --prune --tags "$GIT_REMOTE"; then
+        die "git fetch failed"
+    fi
+    GIT_PREVIOUS_SHA="$(cd "$MAGENTO_DIR" && git rev-parse --verify --quiet HEAD 2>/dev/null || echo "")"
+    GIT_SHA="$(cd "$MAGENTO_DIR" && git rev-parse --verify --quiet "${GIT_REF}^{commit}" 2>/dev/null || echo "")"
+    [[ -n "$GIT_SHA" ]] || die "Cannot resolve git ref '$GIT_REF' (after fetching $GIT_REMOTE)"
+
+    local subject
+    subject="$(cd "$MAGENTO_DIR" && git log -1 --format='%s' "$GIT_SHA" 2>/dev/null | cut -c1-70)"
+    if [[ "$GIT_SHA" == "$GIT_PREVIOUS_SHA" ]]; then
+        ui_info "Already at ${GIT_SHA:0:10} ($subject) - rebuilding this commit"
+    else
+        ui_ok "Deploying ${GIT_SHA:0:10} ($subject), currently ${GIT_PREVIOUS_SHA:0:10}"
+    fi
+    local dirty
+    dirty="$(cd "$MAGENTO_DIR" && git status --porcelain -uno 2>/dev/null | wc -l | tr -d ' ')"
+    if (( dirty > 0 )); then
+        ui_warn "Live checkout has $dirty locally modified tracked file(s); they will be replaced by the release (kept in previous/)"
+    fi
+
+    plan_code_swap
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        ui_dry "Would export $GIT_REF into $(rel_path "$BUILD_ROOT"), merge live vendor/, carry env.php and untracked files"
+        local retire_note=""
+        (( ${#RETIRE_CODE_ITEMS[@]} > 0 )) && retire_note=" and retire: ${RETIRE_CODE_ITEMS[*]}"
+        ui_dry "Would swap: ${SWAP_CODE_ITEMS[*]-}${retire_note}"
+        record_step_time "Source export" $(( SECONDS - start ))
+        return 0
+    fi
+
+    rm -rf "$BUILD_ROOT"
+    mkdir -p "$BUILD_ROOT/pub/static" "$BUILD_ROOT/generated" "$BUILD_ROOT/var" \
+        || die "Cannot create build directory $BUILD_ROOT"
+    git_export_tree "$GIT_SHA" "$BUILD_ROOT" || die "git archive of $GIT_REF failed"
+    [[ -f "$BUILD_ROOT/bin/magento" ]] || die "The exported tree has no bin/magento"
+    chmod +x "$BUILD_ROOT/bin/magento" 2>/dev/null || true
+
+    # vendor: the live packages, hardlinked; git-tracked vendor files win
+    if [[ -d "$MAGENTO_DIR/vendor" ]]; then
+        clone_merge "$MAGENTO_DIR/vendor" "$BUILD_ROOT/vendor"
+        ui_note "merged live vendor/ into the build ($CLONE_MODE)"
+    fi
+    carry_untracked_files
+    # env.php is the live one, always
+    if [[ -f "$MAGENTO_DIR/app/etc/env.php" ]]; then
+        mkdir -p "$BUILD_ROOT/app/etc"
+        cp -p "$MAGENTO_DIR/app/etc/env.php" "$BUILD_ROOT/app/etc/env.php"
+    fi
+    # files composer rewrites in place must not share inodes with live
+    detach_dir vendor/composer
+    detach_file vendor/autoload.php
+    detach_file app/etc/NonComposerComponentRegistration.php
+    if [[ -d "$MAGENTO_DIR/pub/media" && ! -e "$BUILD_ROOT/pub/media" ]]; then
+        ln -s "$MAGENTO_DIR/pub/media" "$BUILD_ROOT/pub/media"
+    fi
+    [[ "$SKIP_DI_COMPILE" == "true" ]] && import_live_generated
+
+    ui_ok "Exported ${GIT_SHA:0:10} into $(rel_path "$BUILD_ROOT")" "$(format_duration $(( SECONDS - start )))"
+    record_step_time "Source export" $(( SECONDS - start ))
 }
 
 create_build_clone() {
@@ -1495,11 +1739,7 @@ create_build_clone() {
 
     # Keeping the current generated code: static deploy must see it
     if [[ "$SKIP_DI_COMPILE" == "true" && "$SKIP_STATIC" != "true" ]]; then
-        for entry in generated/code generated/metadata; do
-            [[ -d "$MAGENTO_DIR/$entry" ]] || continue
-            clone_path "$MAGENTO_DIR/$entry" "$BUILD_ROOT/$entry" \
-                || die "Failed to clone $entry into the build directory"
-        done
+        import_live_generated
     fi
 
     [[ -f "$BUILD_ROOT/bin/magento" ]] || die "Build clone is incomplete: bin/magento missing"
@@ -1751,7 +1991,7 @@ build_phase() {
         return 0
     fi
     ui_phase "Build" "site live, building in $(rel_path "$BUILD_ROOT")"
-    create_build_clone
+    [[ "$GIT_MODE" == "true" ]] || create_build_clone
     di_compile
     dump_autoload_in_build
     deploy_static_content
@@ -1849,6 +2089,11 @@ swap_artifacts() {
         fi
     fi
 
+    if [[ "$GIT_MODE" == "true" ]]; then
+        # code first, so app/ vendor/ and generated/ change as one release
+        items=(${SWAP_CODE_ITEMS[@]+"${SWAP_CODE_ITEMS[@]}"} ${items[@]+"${items[@]}"})
+    fi
+
     if (( ${#items[@]} == 0 )); then
         ui_skip "Artifact swap" "(nothing was built)"
         return 0
@@ -1856,6 +2101,7 @@ swap_artifacts() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         ui_dry "Would swap into place: ${items[*]}"
+        [[ "$GIT_MODE" == "true" ]] && ui_dry "Would move .git HEAD to ${GIT_SHA:0:10} (git reset --mixed, no working tree writes)"
         return 0
     fi
 
@@ -1864,6 +2110,19 @@ swap_artifacts() {
     for entry in "${items[@]}"; do
         swap_item "$entry"
     done
+    for entry in ${RETIRE_CODE_ITEMS[@]+"${RETIRE_CODE_ITEMS[@]}"}; do
+        retire_item "$entry"
+        SWAPPED_ITEMS+=("-$entry")
+    done
+    if [[ "$GIT_MODE" == "true" ]]; then
+        # HEAD/branch and index follow the deployed commit; the working
+        # tree already matches, so nothing is written there
+        if ( cd "$MAGENTO_DIR" && git reset -q --mixed "$GIT_SHA" 2>>"$LOG_FILE" ); then
+            ui_note "git HEAD moved to ${GIT_SHA:0:10}"
+        else
+            ui_warn "git reset to ${GIT_SHA:0:10} failed - run 'git reset --mixed $GIT_SHA' in $MAGENTO_DIR"
+        fi
+    fi
     # Merged/minified bundles are built from the old sources
     if [[ "$SKIP_STATIC" != "true" ]]; then
         retire_item "pub/static/_cache"
@@ -2131,6 +2390,7 @@ CONFIGURATION:
   Maintenance:       $MAINTENANCE
   DB upgrade:        $DB_UPGRADE (ran: $DB_UPGRADE_NEEDED${DB_UPGRADE_REASON:+, reason: $DB_UPGRADE_REASON})
   Config import:     $CONFIG_IMPORT_NEEDED
+  Source:            ${GIT_REF:+git $GIT_REF ${GIT_SHA:0:10} (was ${GIT_PREVIOUS_SHA:0:10})}${GIT_REF:-code in place}
   Artifacts swapped: $ARTIFACTS_SWAPPED (${SWAPPED_ITEMS[*]-none})
   DB backup:         ${LAST_BACKUP_FILE:-none}
   Health check:      ${HEALTHCHECK_URL:-none}
@@ -2236,6 +2496,11 @@ display_config() {
     ui_kv "Parallel" "${PARALLEL_JOBS:-auto (CPU cores)} static-content processes"
     ui_kv "DB upgrade" "$DB_UPGRADE  ${DIM}(setup:upgrade only on database changes)${RESET}"
     ui_kv "Maintenance" "$MAINTENANCE  ${DIM}(auto = only while setup:upgrade runs)${RESET}"
+    if [[ -n "$GIT_REF" ]]; then
+        ui_kv "Source" "git $GIT_REF ($GIT_REMOTE)  ${DIM}(live checkout untouched until the swap)${RESET}"
+    else
+        ui_kv "Source" "code in place  ${DIM}(git pull before running, or use --ref)${RESET}"
+    fi
     [[ -n "$ARTIFACTS_DIR" ]] && ui_kv "Artifacts" "$ARTIFACTS_DIR"
     [[ -n "$HEALTHCHECK_URL" ]] && ui_kv "Health check" "$HEALTHCHECK_URL"
     [[ "$DB_BACKUP" == "true" || -n "$DB_BACKUP_CMD" ]] && ui_kv "DB backup" "enabled"
@@ -2494,8 +2759,13 @@ ${healthcheck:+HEALTHCHECK_URL=$healthcheck}${healthcheck:-#HEALTHCHECK_URL=http
 #DB_BACKUP=true
 #DB_BACKUP_CMD=
 
+# Git mode: deploy this ref (fetch + export into the build, live checkout
+# untouched until the swap). Empty = code already in place.
+#GIT_REF=origin/main
+#GIT_REMOTE=origin
+
 # Hook commands (run in the Magento directory)
-#PRE_DEPLOY_CMD=git pull --ff-only
+#PRE_DEPLOY_CMD=
 #POST_DEPLOY_CMD=
 
 # Build directory (must be on the same filesystem as pub/ and generated/)
@@ -2544,6 +2814,13 @@ main() {
     preflight
     run_pre_deploy_hook
 
+    # Git mode: production mode first (the build copies env.php), then
+    # export the ref into the build - the live checkout is not modified
+    if [[ "$GIT_MODE" == "true" ]]; then
+        [[ "$BUILD_ONLY" != "true" ]] && ensure_production_mode
+        source_phase
+    fi
+
     # Everything up to the release phase happens with the site online
     if [[ -n "$ARTIFACTS_DIR" ]]; then
         ui_phase "Composer" "skipped: releasing pre-built artifacts"
@@ -2558,7 +2835,7 @@ main() {
     fi
 
     # env.php only; the clone copies it, so the build sees the final mode
-    [[ "$BUILD_ONLY" != "true" ]] && ensure_production_mode
+    [[ "$BUILD_ONLY" != "true" && "$GIT_MODE" != "true" ]] && ensure_production_mode
 
     build_phase
 

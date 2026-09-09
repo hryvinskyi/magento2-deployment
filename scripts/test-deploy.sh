@@ -342,7 +342,11 @@ assert_missing "$SANDBOX/var/view_preprocessed/old.less" "old view_preprocessed 
 assert_exists "$SANDBOX/pub/media/catalog/img.jpg" "media untouched"
 assert_missing "$PREVIOUS" "previous artifacts removed after verification"
 assert_missing "$BUILD" "build clone removed after success"
-assert_missing "$SANDBOX/var/.deploy.lock" "lock released after success"
+if command -v flock >/dev/null 2>&1; then
+    if flock -n "$SANDBOX/var/.deploy.lock" true 2>/dev/null; then ok "lock released after success"; else bad "lock released after success [still held]"; fi
+else
+    assert_missing "$SANDBOX/var/.deploy.lock" "lock released after success"
+fi
 assert_grep "$OUT" "Already in production mode\|Application mode: production" "production mode check"
 assert_grep "$OUT" "OPCACHE_RESET_CMD not set" "opcache hint shown when unset"
 if ls "$SANDBOX"/var/log/deploy_report_*.txt >/dev/null 2>&1; then ok "report generated"; else bad "report generated"; fi
@@ -732,6 +736,114 @@ setup_sandbox
 touch "$SANDBOX/var/.regenerate"
 run_deploy --skip-di-compile --skip-static
 assert_grep "$OUT" "run without --skip-di-compile soon" "warns when generated code is kept"
+
+# ── Git mode ───────────────────────────────────────────────────────
+setup_git_sandbox() {
+    setup_sandbox
+    ORIGIN="$WORK/origin.git"
+    rm -rf "$ORIGIN"
+    git init -q --bare "$ORIGIN"
+    git -C "$ORIGIN" symbolic-ref HEAD refs/heads/master
+    (
+        cd "$SANDBOX" || exit 1
+        git init -q
+        git symbolic-ref HEAD refs/heads/master
+        git config user.email t@example.test; git config user.name t
+        # anchored patterns: an unanchored "vendor/" would also match app/code/Vendor on
+        # case-insensitive filesystems (macOS)
+        printf '/app/etc/env.php\n/generated/code/\n/generated/metadata/\n/pub/static/frontend/\n/pub/static/adminhtml/\n/pub/static/_cache/\n/pub/static/deployed_version.txt\n/var/\n/vendor/\n/pub/media/\n/pub/errors/local.xml\n' > .gitignore
+        mkdir -p app/code/Vendor/Module pub/errors lib
+        echo "<?php // version 1" > app/code/Vendor/Module/Thing.php
+        echo "old lib" > lib/old.txt
+        echo "<?php // index v1" > pub/index.php
+        echo "<xml/>" > pub/errors/design.xml
+        echo "<?php // local error config" > pub/errors/local.xml
+        git add -A >/dev/null
+        git commit -q -m "v1"
+        echo "local note" > local-note.txt
+        git remote add origin "$ORIGIN"
+        git push -q origin HEAD:master
+        git branch -q --set-upstream-to=origin/master 2>/dev/null || git branch -q -u origin/master
+    )
+    # a newer commit in origin, made from another clone
+    local clone="$WORK/clone"
+    rm -rf "$clone"
+    git clone -q -b master "$ORIGIN" "$clone"
+    (
+        cd "$clone" || exit 1
+        git config user.email t@example.test; git config user.name t
+        echo "<?php // version 2" > app/code/Vendor/Module/Thing.php
+        git rm -q -r lib
+        echo "<?php // new" > pub/new.php
+        echo "<schema v2/>" > app/code/Vendor/Module/etc/db_schema.xml
+        git add -A >/dev/null
+        git commit -q -m "v2"
+        git push -q origin HEAD:master
+    )
+    NEW_SHA="$(git -C "$clone" rev-parse HEAD)"
+    OLD_SHA="$(git -C "$SANDBOX" rev-parse HEAD)"
+}
+
+echo "=== T30d: git mode deploys a ref without touching the live checkout before the swap ==="
+setup_git_sandbox
+run_deploy --ref origin/master
+assert_exit $RC 0 "git deploy exits 0"
+assert_grep "$OUT" "Deploying ${NEW_SHA:0:10}" "announces the target commit"
+assert_grep "$FAKE_LOG_FILE" "install --no-dev --no-interaction --no-progress --prefer-dist --working-dir=.*var/deploy/build" "composer install runs in the build"
+assert_not_grep "$FAKE_LOG_FILE" "install --no-dev .*--working-dir=$SANDBOX\$" "composer never runs on the live tree"
+assert_grep "$FAKE_LOG_FILE" "var/deploy/build/bin/magento setup:db:status" "db status checked against the new code"
+assert_order "setup:di:compile" "sandbox/bin/magento cache:flush" "live bin/magento used again after the swap"
+assert_grep "$SANDBOX/app/code/Vendor/Module/Thing.php" "version 2" "new code live"
+assert_exists "$SANDBOX/pub/new.php" "new pub file live"
+assert_missing "$SANDBOX/lib" "removed tracked directory retired"
+assert_exists "$SANDBOX/app/etc/env.php" "env.php preserved"
+assert_grep "$SANDBOX/pub/errors/local.xml" "local error config" "ignored file inside a swapped directory carried over"
+assert_exists "$SANDBOX/local-note.txt" "untracked root file untouched"
+assert_exists "$SANDBOX/vendor/magento/x/f.php" "live vendor merged into the release"
+assert_exists "$SANDBOX/pub/media/catalog/img.jpg" "media untouched"
+assert_exists "$SANDBOX/pub/static/frontend/Vendor/alpha/en_GB/css/styles.css" "static content released"
+assert_exists "$SANDBOX/generated/code/Fake/Interceptor.php" "generated code released"
+assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "dumped in .*var/deploy/build" "classmap released"
+assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$NEW_SHA" "git HEAD moved to the deployed commit"
+dirty="$(git -C "$SANDBOX" status --porcelain -uno | wc -l | tr -d ' ')"
+assert_exit "$dirty" 0 "git index matches the working tree after the release"
+assert_grep "$FAKE_LOG_FILE" "setup:upgrade" "changed db_schema.xml in the new commit triggers setup:upgrade"
+assert_grep "$OUT" "carried over" "reports carried over files"
+assert_grep "$OUT" "git HEAD moved" "reports git reset"
+
+echo "=== T30e: git mode failure leaves code, HEAD and artifacts untouched ==="
+setup_git_sandbox
+export FAKE_FAIL_DI=1
+run_deploy --ref origin/master
+assert_exit $RC 1 "git deploy failure exits 1"
+assert_grep "$SANDBOX/app/code/Vendor/Module/Thing.php" "version 1" "live code untouched"
+assert_exists "$SANDBOX/lib/old.txt" "nothing retired"
+assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$OLD_SHA" "git HEAD unchanged"
+assert_exists "$SANDBOX/pub/static/frontend/x/f.css" "live static untouched"
+assert_grep "$OUT" "The live site was not touched" "reports the live site untouched (composer ran in the build only)"
+unset FAKE_FAIL_DI
+
+echo "=== T30f: git mode dry run and validation ==="
+setup_git_sandbox
+run_deploy --ref origin/master --dry-run
+assert_exit $RC 0 "git dry run exits 0"
+assert_grep "$OUT" "Would export origin/master" "dry run describes the export"
+assert_grep "$OUT" "Would swap: app" "dry run lists the code swap"
+assert_grep "$OUT" "retire: lib" "dry run lists retired entries"
+assert_grep "$SANDBOX/app/code/Vendor/Module/Thing.php" "version 1" "dry run changes nothing"
+assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$OLD_SHA" "dry run leaves HEAD"
+run_deploy --ref does-not-exist
+assert_exit $RC 1 "unresolvable ref fails"
+assert_grep "$OUT" "Cannot resolve git ref" "unresolvable ref message"
+setup_sandbox
+run_deploy --ref origin/master
+assert_exit $RC 1 "git mode without a checkout is refused"
+assert_grep "$OUT" "requires .* to be a git checkout" "explains the missing checkout"
+setup_git_sandbox
+run_deploy --git --skip-static --skip-di-compile
+assert_exit $RC 0 "--git uses the upstream"
+assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$NEW_SHA" "--git deployed the upstream commit"
+assert_grep "$SANDBOX/app/code/Vendor/Module/Thing.php" "version 2" "code swapped even without artifacts"
 
 echo "=== T31: developer mode is switched to production ==="
 setup_sandbox

@@ -36,9 +36,10 @@ This script keeps the shop online for the whole build:
 
 | Concern | How it is handled |
 |---|---|
+| Getting the new code | With `--ref` / `--git` the script does `git fetch` (touches only `.git`) and exports the commit into the build clone. The live checkout is not modified until the swap, so there is no "new code, old generated code" window. Without a ref the code is expected to be in place already. |
 | Compiling DI and static content | Done inside a **build clone** of the code tree (`var/deploy/build`) while the live `generated/` and `pub/static/` keep serving traffic. |
 | Multi-core static content | One `setup:static-content:deploy` process per (theme, locale) pair, fanned out with `xargs -P` over all CPU cores. Magento's own `--jobs` option is not used. |
-| Putting the new artifacts live | Directory **renames** (`mv`), which take milliseconds. The replaced artifacts are kept until the release is verified. |
+| Putting the new release live | Directory **renames** (`mv`), which take milliseconds: `generated/`, `pub/static/*`, the Composer classmap and, in git mode, `app/`, `lib/`, `setup/`, `bin/`, `vendor/`, `pub/*`. The replaced entries are kept until the release is verified. |
 | Optimized Composer classmap | Generated **after** `setup:di:compile`, inside the clone, and swapped together with `generated/` so the classmap can never point at missing files. |
 | `setup:upgrade` | Runs **only** when database changes are detected: `setup:db:status`, plus a fingerprint of `db_schema.xml`, `db_schema_whitelist.json`, `module.xml`, `Setup/` files and `app/etc/config.php`. |
 | Maintenance mode | Entered **only** while `setup:upgrade` runs (policy `auto`). A release without database changes has zero downtime. |
@@ -87,10 +88,16 @@ Manual installation is just copying `deploy.sh` into the Magento root and `chmod
 
 ```bash
 cd /var/www/html
-./deploy.sh --init        # detects themes and locales from the database, writes .deploy.env
-./deploy.sh --dry-run     # shows every command that would run, changes nothing
-./deploy.sh               # deploys
+./deploy.sh --init                    # detects themes and locales from the database, writes .deploy.env
+./deploy.sh --ref origin/main --dry-run   # shows every command that would run, changes nothing
+./deploy.sh --ref origin/main         # deploys that commit; the live checkout is untouched until the swap
+./deploy.sh                           # code already in place (after your own git pull / rsync)
 ```
+
+Two ways to get the code onto the server:
+
+- **Git mode** (`--ref REF`, `--git`, `GIT_REF=`): recommended when the Magento root is a git checkout. The script fetches, exports the commit into the build, installs Composer packages there, builds, and swaps code and artifacts together. `git pull` on the live docroot is never needed.
+- **In-place mode** (no ref): the code is already updated (by you, `PRE_DEPLOY_CMD`, rsync, CI); `composer install` runs live and only the artifacts are built and swapped.
 
 Typical `.deploy.env` for a production host:
 
@@ -106,17 +113,17 @@ PARALLEL_JOBS=12
 OPCACHE_RESET_CMD=sudo systemctl reload php8.3-fpm
 HEALTHCHECK_URL=https://www.example.com/
 DB_BACKUP=true
-PRE_DEPLOY_CMD=git pull --ff-only
+GIT_REF=origin/main
 ```
 
-The usual release then is `git pull` (or the pre-deploy hook), followed by `./deploy.sh`.
+The usual release is then just `./deploy.sh`.
 
 ---
 
 ## How a deployment works, phase by phase
 
 ```
-preflight → pre-deploy hook → composer (live) → database check → build (live) → release → verify → post-deploy hook
+preflight → pre-deploy hook → [source: git fetch + export] → composer → database check → build (live) → release → verify → post-deploy hook
 ```
 
 ### 1. Preflight
@@ -134,17 +141,33 @@ Validation errors ask for confirmation to continue; with `--no-interaction` or w
 
 ### 2. Pre-deploy hook
 
-`PRE_DEPLOY_CMD` runs in the Magento directory with its output shown. A non-zero exit aborts the deployment before anything was changed. This is the place for `git pull --ff-only`, notifications, or custom checks.
+`PRE_DEPLOY_CMD` runs in the Magento directory with its output shown. A non-zero exit aborts the deployment before anything was changed. This is the place for notifications or custom checks (and for `git pull --ff-only` if you deploy in in-place mode).
 
-### 3. Composer (site live)
+### 2b. Source (git mode only)
 
-`composer install --no-dev --no-interaction --no-progress --prefer-dist` runs in place from `composer.lock` (a missing lock file aborts). The shop keeps serving; Composer replaces packages atomically per file, and Magento's OPcache keeps the old bytecode until it is reset.
+Active with `--ref REF`, `--git` (the current branch's upstream) or `GIT_REF`. The Magento root must be a git checkout and `git`, `tar` must be available.
+
+1. Production mode is ensured first (`env.php` only), because the build copies `env.php`.
+2. `git fetch --prune --tags GIT_REMOTE` (default remote `origin`). This touches nothing but `.git`. A dry run fetches too, otherwise it would plan against a stale ref.
+3. The ref is resolved to a commit; an unresolvable ref aborts. The current `HEAD` is remembered. Locally modified tracked files in the live checkout produce a warning: they will be replaced by the release (and kept in `var/deploy/previous`).
+4. The swap plan is computed from `git ls-tree`: every tracked top-level entry of the new commit except `.git*`, `var`, `generated`, `pub`, `deploy.sh` and `.deploy.env`, plus every tracked entry directly under `pub/` except `pub/media` and `pub/static`. Tracked entries that exist in the current commit but not in the new one are scheduled to be retired.
+5. `git archive <commit> | tar -x` exports the tree into `var/deploy/build`. The live `vendor/` is then **merged** into the build with hardlinks (`cp -aln`; APFS clones on macOS; `BUILD_COPY_VENDOR=true` forces a real copy) without overwriting files that came from git, so `composer install` afterwards only has to install what changed.
+6. Untracked and ignored files that live **inside the directories that will be swapped** (for example `app/etc/env.php`, `pub/errors/local.xml`, local module configs) are carried over into the build with `git ls-files --others`, so they survive the swap. The live `app/etc/env.php` is always copied last. Untracked entries next to swapped ones (a `pub/customwp/`, root-level scripts) are simply not part of the swap and stay as they are.
+7. `vendor/composer`, `vendor/autoload.php` and `app/etc/NonComposerComponentRegistration.php` are detached so Composer cannot write through hardlinks into the live tree; `pub/media` is symlinked; with `--skip-di-compile` the live generated code is cloned in.
+
+From here on the build directory is a complete, self-contained copy of the new release, and the live checkout has not been modified.
+
+### 3. Composer
+
+`composer install --no-dev --no-interaction --no-progress --prefer-dist` runs from `composer.lock` (a missing lock file aborts). In **git mode** it runs inside the build (`--working-dir=var/deploy/build`), the live `vendor/` is untouched. In **in-place mode** it runs live; the shop keeps serving because Composer replaces packages atomically per file and OPcache keeps the old bytecode until it is reset.
 
 Composer writes a **plain** autoloader here. The optimized classmap is deliberately **not** generated at this point: `composer dump-autoload --optimize` hard-codes every file in `generated/code`, and that directory is about to be replaced. See phase 5.
 
 `--skip-composer` skips this phase.
 
 ### 4. Database check
+
+In git mode every `bin/magento` call of this phase uses the **build's** `bin/magento`, so the status is checked against the new code (the database and `env.php` are the live ones).
 
 1. A leftover `var/.regenerate` flag is removed. Magento deletes `generated/` and `var/cache` on its **next bootstrap** when this flag exists (`module:enable` / `module:disable` leave it behind). On a live production site that would be a fatal-error window, and this deployment rebuilds the generated code anyway. With `--skip-di-compile` a warning explains that the code Magento wanted rebuilt is being kept.
 2. `setup:db:status` — exit code 2 means module versions require an upgrade.
@@ -163,7 +186,7 @@ Composer writes a **plain** autoloader here. The optimized classmap is deliberat
 
 Skipped entirely with `--skip-di-compile --skip-static`; the clone is only created when something has to be built.
 
-**Clone.** `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json` and `composer.lock` are cloned into `var/deploy/build`:
+**Clone (in-place mode; in git mode the build directory already exists from the source phase).** `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json` and `composer.lock` are cloned into `var/deploy/build`:
 
 - Linux: `cp -al` (hardlinks; 160 000 vendor files take a few seconds, no extra disk space);
 - macOS on APFS: `cp -Rpc` (copy-on-write clones);
@@ -196,11 +219,12 @@ The phase header says whether a maintenance window will be used and why.
 
 1. **Database backup** (when `setup:upgrade` will run and `DB_BACKUP=true` or `DB_BACKUP_CMD` is set). It runs **before** the maintenance window so it does not add downtime. The built-in backup reads the credentials from `app/etc/env.php` (`host:port` notation supported) and writes a gzipped `mysqldump --single-transaction` into `var/backups/deploy_db_<timestamp>.sql.gz`.
 2. **Maintenance mode** is enabled only when `setup:upgrade` will run (`MAINTENANCE=auto`) or when `MAINTENANCE=always`. `MAINTENANCE_ALLOWED_IPS` are passed as `--ip` options.
-3. **Artifact swap.** For every artifact the live directory is moved to `var/deploy/previous/<path>` and the built one is moved into place:
+3. **Swap.** For every entry the live one is moved to `var/deploy/previous/<path>` and the built one is moved into place:
+   - in git mode first the code: `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json`, `composer.lock`, every other tracked top-level entry, and `pub/*` except `media` and `static`; tracked entries removed by the new commit are retired;
    - `generated/code`, `generated/metadata`, `vendor/composer`, `vendor/autoload.php` (when compiled);
    - `var/view_preprocessed` and every entry of the clone's `pub/static/` except `.htaccess` — normally `frontend`, `adminhtml`, `deployed_version.txt` (when static content was deployed);
    - `pub/static/_cache` (merged/minified bundles built from the old sources) is retired, it is regenerated on demand.
-   Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are.
+   Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
 4. **`setup:upgrade --keep-generated --no-interaction`** runs when required. `--keep-generated` is correct here because the generated code was compiled from exactly this code in the build phase. On success the database fingerprint is stored.
 5. **`cache:flush`** (a failure only warns).
 6. **OPcache reset** via `OPCACHE_RESET_CMD`. With `opcache.validate_timestamps=0` php-fpm keeps serving the previous release from OPcache until it is reset or reloaded; without the command a reminder is printed.
@@ -229,9 +253,11 @@ What is and is not guaranteed, so nobody gets surprised:
 - **No maintenance window without database changes.** Compile, static content, classmap and the swap all happen with the shop online.
 - **Renames, not deletes.** The old `generated/` and `pub/static/` are never removed before the new ones exist. The swap itself is a series of `mv` calls that take milliseconds.
 - **Static URLs keep working across the swap.** Magento serves `static/version<N>/…` through a rewrite that ignores the version, so pages cached in Varnish or the full page cache with the old version still resolve against the new files.
-- **Code is updated in place before the build.** With a git checkout in the docroot, `git pull` and `composer install` change `app/`, `vendor/` while the previous `generated/` is still live. This window also exists with a classic deployment; the script keeps it and does not enlarge the damage: only a class whose constructor signature changed *and* which has a generated interceptor or proxy can error during that window. Closing it completely requires a `releases/<n>` + `current` symlink layout and a web server docroot change, which is outside what an in-place script can do. `--build-only` + `--artifacts` (see [Pipeline mode](#pipeline-mode-build-once-release-elsewhere)) shortens the window to the swap itself when the code is deployed as a whole afterwards.
+- **Git mode: the live tree changes only at the swap.** Code, vendor packages, generated code, classmap and static content are renamed into place one after another; the whole sequence takes milliseconds. A request that hits exactly that window may see a mix of old and new files. There is no state where new code runs against old generated code for minutes.
+- **In-place mode has a window.** When you run `git pull` and `composer install` on the live docroot yourself, `app/` and `vendor/` are new while the previous `generated/` is still live, for the duration of the build. This window also exists with a classic deployment; only a class whose constructor signature changed *and* which has a generated interceptor or proxy can error during it. Use git mode or [pipeline mode](#pipeline-mode-build-once-release-elsewhere) to avoid it.
 - **`setup:di:compile` clears the cache backend at start.** That is Magento's behaviour; the live site rebuilds its cache from unchanged configuration while the compile runs.
-- **Vendor packages are not swapped.** `composer install` runs in place; only the autoloader files under `vendor/composer` and `vendor/autoload.php` are part of the swap.
+- **Vendor packages are swapped only in git mode.** In in-place mode `composer install` runs live and only the autoloader files under `vendor/composer` and `vendor/autoload.php` are part of the swap.
+- **`pub/media` and `var/` are never touched**, in any mode. Tracked files under `pub/media` are not updated by the swap.
 - **`setup:upgrade` always needs a window** in policy `auto`. Its duration is the downtime; the backup and the whole build are outside it.
 
 ---
@@ -243,11 +269,12 @@ The script exits non-zero, prints a red `DEPLOYMENT FAILED` banner with the fail
 | When it failed | State of the live site | What to do |
 |---|---|---|
 | Preflight, pre-deploy hook | Untouched. | Fix the reported problem, run again. |
-| Composer install | `vendor/` may be partially updated; generated code and static content are untouched. | Run again (Composer resumes). |
+| Source (git fetch, export) | Untouched. | Check the ref name, remote access, disk space. |
+| Composer install | In-place mode: `vendor/` may be partially updated; generated code and static content are untouched. Git mode: untouched, everything happened in the build. | Run again (Composer resumes). |
 | Database check, config import | Nothing swapped. | Read the command output in the log, run again. |
 | Build (clone, compile, classmap, static content) | **Untouched.** The build clone stays in `var/deploy/build` for inspection and is removed by the next run. | Fix the cause (usually a code error), run again. |
 | Release before `setup:upgrade` (swap failed) | The swap restores the previous entry when the second rename fails. | Check disk space and permissions, run again. |
-| `setup:upgrade` | **Maintenance mode stays ENABLED.** New artifacts are live, the previous ones are in `var/deploy/previous`. | Fix the upgrade problem and run the deployment again, or restore manually: move each entry from `var/deploy/previous` back (for example `generated/code`, `vendor/composer`, `pub/static/frontend`), then `bin/magento maintenance:disable`. A `DB_BACKUP` dump is in `var/backups/`. |
+| `setup:upgrade` | **Maintenance mode stays ENABLED.** New artifacts (and in git mode the new code) are live, the previous ones are in `var/deploy/previous`. | Fix the upgrade problem and run the deployment again, or restore manually: move each entry from `var/deploy/previous` back (for example `app`, `vendor`, `generated/code`, `pub/static/frontend`), in git mode `git reset --mixed <previous commit>`, then `bin/magento maintenance:disable`. A `DB_BACKUP` dump is in `var/backups/`. |
 | Health check | Site is open but returned a non-2xx status; previous artifacts kept. | Inspect the site; restore from `var/deploy/previous` if needed. |
 | Interrupted (Ctrl+C, SIGTERM) | Running child processes are killed; state as in the row matching the phase. | Same as above. |
 
@@ -315,6 +342,9 @@ Set in `.deploy.env` (KEY=VALUE, `#` comments, quotes optional) or the environme
 | `BACKEND_LANGUAGES` | `en_US` | Backend locales. |
 | `PARALLEL_JOBS` | CPU cores | Static content processes running at once (capped at the core count). |
 | `SCD_EXTRA_ARGS` | empty | Extra options appended to every `setup:static-content:deploy`. |
+| `GIT_REF` | empty | Git mode: branch, tag or commit to deploy (`origin/main`, `v1.4.2`, a SHA, `@{upstream}`). Empty = in-place mode. |
+| `GIT_REMOTE` | `origin` | Remote fetched before resolving `GIT_REF`. |
+| `BUILD_COPY_VENDOR` | `false` | Copy the live `vendor/` into the build instead of hardlinking it. |
 | `DB_UPGRADE` | `auto` | `auto`, `always`, `never`. |
 | `MAINTENANCE` | `auto` | `auto`, `always`, `never`. |
 | `MAINTENANCE_ALLOWED_IPS` | empty | IPs allowed during a window. |
@@ -354,6 +384,8 @@ deploy.sh [OPTIONS]
 -p, --php PATH          PHP binary
 -c, --composer PATH     Composer binary
 -j, --jobs NUM          Parallel static-content processes
+--ref REF               Git mode: deploy this branch/tag/commit (fetches GIT_REMOTE first)
+--git                   Git mode using the current branch's upstream
 --db-upgrade MODE       auto | always | never
 --maintenance MODE      auto | always | never
 --memory-limit LIMIT    PHP memory_limit
@@ -381,7 +413,9 @@ deploy.sh [OPTIONS]
 Examples:
 
 ```bash
-./deploy.sh                                   # full zero-downtime deployment
+./deploy.sh --ref origin/main                 # fetch + deploy a commit, live checkout untouched until the swap
+./deploy.sh --git                             # same, using the current branch's upstream
+./deploy.sh                                   # code already in place
 ./deploy.sh --dry-run -v                      # preview, verbose
 ./deploy.sh -j 16                             # 16 static-content processes
 ./deploy.sh --skip-static --skip-di-compile   # code-only release (composer + db check + cache flush)
@@ -467,6 +501,10 @@ CI (`.github/workflows/ci.yml`) runs ShellCheck, the test suite on Ubuntu (flock
 **The shop still serves old code after the release.** php-fpm runs with `opcache.validate_timestamps=0`. Set `OPCACHE_RESET_CMD` (`cachetool opcache:reset`, or a php-fpm reload).
 
 **Maintenance mode is still on after a failure.** That is intentional after a failed `setup:upgrade`. Fix, rerun or restore from `var/deploy/previous`, then `bin/magento maintenance:disable`.
+
+**Git mode: `Live checkout has N locally modified tracked file(s)`.** Someone edited files on the server. The release replaces them with the committed versions and keeps the old ones in `var/deploy/previous`. Commit or discard those edits first if they matter.
+
+**Git mode: a file under `app/` or `pub/` disappeared after the release.** It was untracked and not ignored inside a swapped directory, and `git ls-files --others` did not list it because a `.gitignore` pattern excluded it while another pattern such as an unanchored `vendor/` also matched a path like `app/code/Vendor`. Anchor such patterns (`/vendor/`); the previous copy is in `var/deploy/previous`.
 
 **Merged CSS/JS looks stale.** `pub/static/_cache` is retired on every static deployment; if you run with `--skip-static`, remove it manually or flush the static files cache in the admin.
 
