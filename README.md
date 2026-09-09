@@ -15,16 +15,18 @@
 5. [How a deployment works, phase by phase](#how-a-deployment-works-phase-by-phase)
 6. [Zero-downtime model and its limits](#zero-downtime-model-and-its-limits)
 7. [Failure handling and recovery](#failure-handling-and-recovery)
-8. [Policies: `DB_UPGRADE` and `MAINTENANCE`](#policies-db_upgrade-and-maintenance)
-9. [Pipeline mode: build once, release elsewhere](#pipeline-mode-build-once-release-elsewhere)
-10. [Configuration reference](#configuration-reference)
-11. [Command line reference](#command-line-reference)
-12. [Logs, reports and retention](#logs-reports-and-retention)
-13. [Locking](#locking)
-14. [Terminal output](#terminal-output)
-15. [Testing](#testing)
-16. [Troubleshooting](#troubleshooting)
-17. [License](#license)
+8. [Rollback](#rollback)
+9. [Autoloader and `var/.regenerate`](#autoloader-and-varregenerate)
+10. [Policies: `DB_UPGRADE` and `MAINTENANCE`](#policies-db_upgrade-and-maintenance)
+11. [Pipeline mode: build once, release elsewhere](#pipeline-mode-build-once-release-elsewhere)
+12. [Configuration reference](#configuration-reference)
+13. [Command line reference](#command-line-reference)
+14. [Logs, reports and retention](#logs-reports-and-retention)
+15. [Locking](#locking)
+16. [Terminal output](#terminal-output)
+17. [Testing](#testing)
+18. [Troubleshooting](#troubleshooting)
+19. [License](#license)
 
 ---
 
@@ -40,7 +42,9 @@ This script keeps the shop online for the whole build:
 | Compiling DI and static content | Done inside a **build clone** of the code tree (`var/deploy/build`) while the live `generated/` and `pub/static/` keep serving traffic. |
 | Multi-core static content | One `setup:static-content:deploy` process per (theme, locale) pair, fanned out with `xargs -P` over all CPU cores. Magento's own `--jobs` option is not used. |
 | Putting the new release live | Directory **renames** (`mv`), which take milliseconds: `generated/`, `pub/static/*`, the Composer classmap and, in git mode, `app/`, `lib/`, `setup/`, `bin/`, `vendor/`, `pub/*`. The replaced entries are kept until the release is verified. |
-| Optimized Composer classmap | Generated **after** `setup:di:compile`, inside the clone, and swapped together with `generated/` so the classmap can never point at missing files. |
+| Composer autoloader | Plain by default. `AUTOLOAD_OPTIMIZE=true` dumps an optimized classmap **after** `setup:di:compile`, inside the clone, swapped together with `generated/` and verified after the swap; see [Autoloader](#autoloader-and-varregenerate) for why it is opt-in. |
+| Wrong theme or locale list | Before anything is built, the configured themes and locales are compared with the store views in the database. A theme or locale the shop uses but the config lacks aborts the run (`STORE_CHECK=strict`), because the storefront would have no CSS/JS after the swap. |
+| Rollback | The replaced release stays in `var/deploy/previous` until the next deployment; `deploy.sh --rollback` puts it back and reopens the site. A broken swap is rolled back automatically before any `bin/magento` call. |
 | `setup:upgrade` | Runs **only** when database changes are detected: `setup:db:status`, plus a fingerprint of `db_schema.xml`, `db_schema_whitelist.json`, `module.xml`, `Setup/` files and `app/etc/config.php`. |
 | Maintenance mode | Entered **only** while `setup:upgrade` runs (policy `auto`). A release without database changes has zero downtime. |
 | Everything else | Locking, pre/post hooks, OPcache reset, health check, database backup, IP whitelist, dry run, logs, reports, retention, a config wizard. |
@@ -134,6 +138,7 @@ preflight → pre-deploy hook → [source: git fetch + export] → composer → 
 - Validates every option; invalid values fall back to their defaults with a warning.
 - Checks that `BUILD_DIR` (default `var/deploy`) is on the same filesystem as `pub/`.
 - Reports CPU cores, free memory and free disk. `PARALLEL_JOBS` defaults to the core count and is capped at it; a warning is printed when the jobs would need more memory than is available (about 700 MB per process).
+- **Store design check.** Reads, through the credentials in `env.php`, every theme assigned to a store view (`design/theme/theme_id` joined with the `theme` table), every store locale (`general/locale/code`, `en_US` when none is set) and the interface locales of active admin users. A frontend theme or store locale that is not in `FRONTEND_THEMES` / `FRONTEND_LANGUAGES`, or a backend theme that is not `BACKEND_THEME`, aborts the run with `STORE_CHECK=strict` (default) and warns with `warn`; an admin locale missing from `BACKEND_LANGUAGES` only warns. An unreachable database warns that nothing was verified. Skipped with `--skip-static` or `STORE_CHECK=off`. This exists because a deployment with the wrong theme list succeeds technically and leaves the storefront without CSS/JS.
 - Takes the deployment lock (see [Locking](#locking)).
 - Warns when running as root (files would be root-owned).
 
@@ -169,7 +174,7 @@ Composer writes a **plain** autoloader here. The optimized classmap is deliberat
 
 In git mode every `bin/magento` call of this phase uses the **build's** `bin/magento`, so the status is checked against the new code (the database and `env.php` are the live ones).
 
-1. A leftover `var/.regenerate` flag is removed. Magento deletes `generated/` and `var/cache` on its **next bootstrap** when this flag exists (`module:enable` / `module:disable` leave it behind). On a live production site that would be a fatal-error window, and this deployment rebuilds the generated code anyway. With `--skip-di-compile` a warning explains that the code Magento wanted rebuilt is being kept.
+1. A leftover `var/.regenerate` flag is removed. Magento deletes `generated/` and `var/cache` on its **next bootstrap** when this flag exists; `module:enable` / `module:disable` and the `magento/magento-composer-installer` plugin (on every `composer install`) create it. On a live production site that would be a fatal-error window, and this deployment rebuilds the generated code anyway. With `--skip-di-compile` a warning explains that the code Magento wanted rebuilt is being kept. The same guard runs again before every `bin/magento` call of the release phase and reports when the flag reappeared (see [Autoloader and `var/.regenerate`](#autoloader-and-varregenerate)).
 2. `setup:db:status` — exit code 2 means module versions require an upgrade.
 3. `app:config:status` — exit code 2 means `config.php` / `env.php` contain settings that are not in the database yet.
 4. **Database fingerprint.** `setup:db:status` only compares `setup_version` values; modules without one (every module using declarative schema and data patches) are always reported as up to date. The script therefore computes a checksum over every `db_schema.xml`, `db_schema_whitelist.json`, `module.xml` and `Setup/**/*.php` in `app/code` and `vendor`, plus `app/etc/config.php`, using paths relative to the Magento root. The value of the last successful upgrade is stored in `var/deploy/db-fingerprint`. A different value means new schema or patches exist and `setup:upgrade` is required. Without a stored value (first run, or after `var/` was cleaned) the upgrade runs once to establish the baseline.
@@ -200,7 +205,7 @@ With `--skip-di-compile` but static deployment enabled, the live `generated/code
 
 **Compile.** `setup:di:compile` runs in the clone, with one retry. Note that Magento's compiler cleans the configured cache backend at start (Redis included) exactly as it would in a classic deployment. Whatever the compiler leaves under `generated/` is treated as the result: `generated/code` is required, `generated/metadata` is optional, and additional directories such as `generated/staticcache` written by alternative compilers (for example `creatuity/magento2-interceptors`, which produces no `metadata` at all) are picked up automatically.
 
-**Optimized autoloader.** `composer dump-autoload --optimize --apcu --no-plugins --working-dir=<clone>` builds the classmap against the freshly generated code. The result (`vendor/composer/`, `vendor/autoload.php`) is swapped into place together with `generated/` in the release phase. `--apcu` is harmless without the extension; `--no-plugins` avoids repeating plugin side effects that already happened during the live `composer install`.
+**Autoloader.** `composer dump-autoload --no-plugins --working-dir=<clone>` regenerates the autoloader in the build; with `AUTOLOAD_OPTIMIZE=true` it adds `--optimize --apcu` and the resulting classmap is checked against the generated files before the build is accepted. The result (`vendor/composer/`, `vendor/autoload.php`) is swapped into place together with `generated/` in the release phase. `--no-plugins` avoids repeating plugin side effects that already happened during `composer install`.
 
 **Static content.** A job list is built: every frontend theme × every frontend locale, plus the backend theme × every backend locale. Each job is one process:
 
@@ -224,7 +229,8 @@ The phase header says whether a maintenance window will be used and why.
    - every entry under the build's `generated/` except `.htaccess` (`code`, `metadata`, `staticcache`, ...), `vendor/composer`, `vendor/autoload.php` (when compiled); live entries under `generated/` that the new compile did not produce are retired, so a stale `metadata` cannot survive a switch to another compiler;
    - `var/view_preprocessed` and every entry of the clone's `pub/static/` except `.htaccess` — normally `frontend`, `adminhtml`, `deployed_version.txt` (when static content was deployed);
    - `pub/static/_cache` (merged/minified bundles built from the old sources) is retired, it is regenerated on demand.
-   Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
+   Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. A manifest of every swapped and retired entry is written to `var/deploy/previous/.manifest` for `--rollback`.
+   **Verification.** Right after the swap and before any `bin/magento` call, the live tree is checked: `generated/code` exists and is not empty, `vendor/autoload.php` exists, and every classmap entry that points into `generated/` resolves to a file. If anything is wrong the swap is undone automatically (the rejected files go to `var/deploy/failed`), maintenance mode is disabled again and the run fails; nothing irreversible has happened at that point. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
 4. **`setup:upgrade --keep-generated --no-interaction`** runs when required. `--keep-generated` is correct here because the generated code was compiled from exactly this code in the build phase. On success the database fingerprint is stored.
 5. **`cache:flush`** (a failure only warns).
 6. **OPcache reset** via `OPCACHE_RESET_CMD`. With `opcache.validate_timestamps=0` php-fpm keeps serving the previous release from OPcache until it is reset or reloaded; without the command a reminder is printed.
@@ -234,7 +240,7 @@ The phase header says whether a maintenance window will be used and why.
 
 - **Health check**: `curl` fetches `HEALTHCHECK_URL` (redirects followed) up to `HEALTHCHECK_RETRIES` times with `HEALTHCHECK_TIMEOUT` seconds each; anything but HTTP 2xx fails the deployment.
 - **Post-deployment checks**: file counts of `generated/code`, `generated/metadata`, `pub/static`, presence of `pub/static/deployed_version.txt`, application mode, maintenance status.
-- The previous artifacts in `var/deploy/previous` are deleted (kept with `--keep-previous`), and the build clone is removed.
+- The build clone is removed. The previous release stays in `var/deploy/previous` until the next deployment replaces it, so `--rollback` remains possible after a deployment that verified fine but turns out to be bad.
 
 ### 8. Post-deploy hook
 
@@ -274,13 +280,40 @@ The script exits non-zero, prints a red `DEPLOYMENT FAILED` banner with the fail
 | Database check, config import | Nothing swapped. | Read the command output in the log, run again. |
 | Build (clone, compile, classmap, static content) | **Untouched.** The build clone stays in `var/deploy/build` for inspection and is removed by the next run. | Fix the cause (usually a code error), run again. |
 | Release before `setup:upgrade` (swap failed) | The swap restores the previous entry when the second rename fails. | Check disk space and permissions, run again. |
-| `setup:upgrade` | **Maintenance mode stays ENABLED.** New artifacts (and in git mode the new code) are live, the previous ones are in `var/deploy/previous`. | Fix the upgrade problem and run the deployment again, or restore manually: move each entry from `var/deploy/previous` back (for example `app`, `vendor`, `generated/code`, `pub/static/frontend`), in git mode `git reset --mixed <previous commit>`, then `bin/magento maintenance:disable`. A `DB_BACKUP` dump is in `var/backups/`. |
-| Health check | Site is open but returned a non-2xx status; previous artifacts kept. | Inspect the site; restore from `var/deploy/previous` if needed. |
+| Swap verification (classmap or generated code inconsistent) | Rolled back automatically, maintenance mode disabled again. | Read the reported problem; the rejected files are in `var/deploy/failed`. |
+| `setup:upgrade` | **Maintenance mode stays ENABLED.** New artifacts (and in git mode the new code) are live, the previous ones are in `var/deploy/previous`. | Fix the upgrade problem and run the deployment again, or `deploy.sh --rollback` (reopens the site; the database is not reverted, a `DB_BACKUP` dump is in `var/backups/`). |
+| Health check | Site is open but returned a non-2xx status; previous release kept. | Inspect the site; `deploy.sh --rollback` if needed. |
 | Interrupted (Ctrl+C, SIGTERM) | Running child processes are killed; state as in the row matching the phase. | Same as above. |
 
 Maintenance mode is intentionally **not** disabled automatically after a failed upgrade: a half-upgraded database should not be exposed blindly.
 
 The lock is released on every exit path, so the next run never has to remove a stale lock after a crash (macOS PID locks detect dead processes).
+
+---
+
+## Rollback
+
+```bash
+./deploy.sh --rollback            # asks for confirmation; --no-interaction skips it
+./deploy.sh --rollback --dry-run  # only lists what would be restored
+```
+
+`--rollback` reads `var/deploy/previous/.manifest`, moves every swapped and retired entry back (the current files go to `var/deploy/failed`), moves `.git` back to the previous commit in git mode, removes `var/.regenerate`, flushes caches, runs `OPCACHE_RESET_CMD`, disables maintenance mode when it is active, and runs the health check and post-deployment checks. It builds nothing and takes seconds.
+
+What it does **not** do: revert the database. When the manifest records that `setup:upgrade` started, the command says so; restore the `DB_BACKUP` dump yourself if the schema changed. A rollback is possible until the next deployment overwrites `var/deploy/previous`; a second `--rollback` in a row is refused because the manifest is consumed.
+
+---
+
+## Autoloader and `var/.regenerate`
+
+Magento's `ObjectManagerFactory` deletes `generated/code`, `generated/metadata` and `var/cache` at the start of **any** bootstrap, web request or CLI, when the file `var/.regenerate` exists. Several things create that file: `module:enable` / `module:disable`, and the `magento/magento-composer-installer` plugin on every `composer install` or `composer update`.
+
+With Composer's plain autoloader this is a slowdown: missing classes are regenerated on demand. With an optimized classmap (`composer dump-autoload --optimize`) it is an outage: the classmap hard-codes paths under `generated/code`, Composer's `include` fails and PHP dies with `Failed to open stream ... Proxy.php` on every request, including the `setup:upgrade` of a running deployment. Both incidents that shaped this section happened exactly that way.
+
+Therefore:
+
+- The autoloader is **plain by default** (`AUTOLOAD_OPTIMIZE=false`). Under OPcache the difference to the classmap is a few percent at most.
+- `AUTOLOAD_OPTIMIZE=true` / `--optimize-autoloader` opts in. The classmap is then built in the clone after `setup:di:compile`, checked in the build, swapped together with `generated/`, and checked again on the live tree right after the swap (with automatic rollback). The script also removes `var/.regenerate` before every `bin/magento` call it makes and warns when it reappeared. What it cannot prevent is a flag created **after** the deployment by someone running `composer` or `module:enable` on the live tree: enable the classmap only on hosts where that does not happen.
 
 ---
 
@@ -304,7 +337,7 @@ The lock is released on every exit path, so the next run never has to remove a s
 
 ## Pipeline mode: build once, release elsewhere
 
-The build phase produces plain files: `generated/` (all of it), `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. None of them contain absolute paths, so they can be built on a workstation or CI runner and released on the server.
+The build phase produces plain files: `generated/` (all of it), `vendor/composer/`, `vendor/autoload.php`, `pub/static/`, `var/view_preprocessed/`. The store design check runs on the release side (`--artifacts`) against the server's database; on the build side it needs the same database or `STORE_CHECK=warn`. None of them contain absolute paths, so they can be built on a workstation or CI runner and released on the server.
 
 ```bash
 # on the build machine (same commit, same composer.lock, same app/etc/config.php)
@@ -348,8 +381,9 @@ Set in `.deploy.env` (KEY=VALUE, `#` comments, quotes optional) or the environme
 | `DB_UPGRADE` | `auto` | `auto`, `always`, `never`. |
 | `MAINTENANCE` | `auto` | `auto`, `always`, `never`. |
 | `MAINTENANCE_ALLOWED_IPS` | empty | IPs allowed during a window. |
-| `BUILD_DIR` | `var/deploy` | Build, previous-artifacts and state directory. |
-| `KEEP_PREVIOUS` | `false` | Keep `var/deploy/previous` after success. |
+| `BUILD_DIR` | `var/deploy` | Build, previous-release and state directory. |
+| `AUTOLOAD_OPTIMIZE` | `false` | `true` dumps an optimized classmap with APCu support in the build (see [Autoloader](#autoloader-and-varregenerate)). |
+| `STORE_CHECK` | `strict` | `strict` aborts, `warn` warns, `off` skips the comparison of themes/locales with the store views. |
 | `ARTIFACTS_DIR` | empty | Release pre-built artifacts from this directory (`--artifacts`). |
 | `BUILD_ONLY` | `false` | Stop after the build (`--build-only`). |
 | `PUSH_TARGET`, `PUSH_RUN` | empty, `false` | `--push`, `--push-run`. |
@@ -393,7 +427,9 @@ deploy.sh [OPTIONS]
 --skip-db-check         Skip status checks and setup:upgrade
 --skip-static           Keep current static content
 --skip-di-compile       Keep current generated code and autoloader
---keep-previous         Keep replaced artifacts in var/deploy/previous
+--rollback              Restore the previous release from var/deploy/previous and reopen the site
+--optimize-autoloader   Optimized classmap + APCu (AUTOLOAD_OPTIMIZE=true)
+--store-check MODE      strict | warn | off
 --build-only            Build, do not release
 --artifacts DIR         Release pre-built artifacts from DIR
 --push user@host:DIR    Build and rsync artifacts to the server (implies --build-only)
@@ -420,6 +456,7 @@ Examples:
 ./deploy.sh -j 16                             # 16 static-content processes
 ./deploy.sh --skip-static --skip-di-compile   # code-only release (composer + db check + cache flush)
 ./deploy.sh --db-upgrade never                # first run on a host whose database is known to be current
+./deploy.sh --rollback                        # put the previous release back
 ./deploy.sh --maintenance always              # atomic release inside one window
 ./deploy.sh --build-only                      # produce artifacts only
 ./deploy.sh --push www@shop:/var/www/html --push-run
@@ -434,6 +471,7 @@ Examples:
 - Database backups: `var/backups/deploy_db_<timestamp>.sql.gz`.
 - Retention: files older than `LOG_RETENTION_DAYS` are removed at the start of a run (`deploy_*.log`, `deploy_report_*.txt`, `deploy_*_scd` directories, `deploy_db_*.sql.gz`, and legacy `deployment_*.log` in the root). `0` disables.
 - `var/deploy/db-fingerprint` holds the fingerprint of the last successful upgrade. Deleting it triggers exactly one extra `setup:upgrade`.
+- `var/deploy/previous` (with `.manifest`) is the replaced release, kept until the next deployment; `var/deploy/failed` holds files rejected by a rollback.
 
 Add `var/deploy/` and `var/backups/` to `.gitignore` when the Magento root is a git checkout.
 
@@ -488,7 +526,9 @@ CI (`.github/workflows/ci.yml`) runs ShellCheck, the test suite on Ubuntu (flock
 
 ## Troubleshooting
 
-**`include(...generated/code/.../Proxy.php): Failed to open stream` right after Composer.** An optimized classmap referenced generated files that Magento deleted because `var/.regenerate` existed. Version 3 never dumps an optimized classmap on the live tree and removes the flag before the first `bin/magento` call. Run the deployment again; the plain autoloader regenerates missing proxies on demand.
+**`include(...generated/code/.../Proxy.php): Failed to open stream`.** An optimized classmap referenced generated files that Magento deleted because `var/.regenerate` existed (see [Autoloader and `var/.regenerate`](#autoloader-and-varregenerate)). If it happened during a deployment: `deploy.sh --rollback`, then run the deployment again with the default plain autoloader. If it happened on a live site: `composer dump-autoload` (plain) brings it back immediately, then find out what created the flag.
+
+**The storefront has no CSS/JS after a successful deployment.** The deployed theme or locale list did not match the store views (for example the defaults `Magento/luma,Magento/blank` / `en_GB` while the shop runs another theme in `en_US`). `deploy.sh --rollback` restores the previous static content, then run `deploy.sh --init` or set `FRONTEND_THEMES` / `FRONTEND_LANGUAGES` correctly; since 3.2 the store design check aborts such a run before anything is built.
 
 **`BUILD_DIR is on a different filesystem`.** Renames and hardlinks need one filesystem. Set `BUILD_DIR` to a directory on the same mount as `pub/` and `generated/`.
 

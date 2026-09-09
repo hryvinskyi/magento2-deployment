@@ -20,8 +20,18 @@
 #     through xargs -P, using every CPU core instead of Magento's own
 #     --jobs implementation.
 #   * The finished artifacts are swapped into place with directory
-#     renames (milliseconds), the previous ones are kept until the
-#     deployment has been verified.
+#     renames (milliseconds). The previous release stays in
+#     var/deploy/previous until the next deployment; deploy.sh --rollback
+#     puts it back.
+#   * Before the build, the themes and locales configured for the
+#     deployment are checked against the store views in the database:
+#     a theme or locale the shop uses but the config lacks would leave
+#     the storefront without CSS/JS after the swap (STORE_CHECK).
+#   * The optimized composer classmap is off by default: Magento wipes
+#     generated/ on the next bootstrap whenever var/.regenerate exists
+#     (composer plugins and module:enable create it), and a classmap that
+#     hard-codes generated files then takes the site down. The plain
+#     autoloader recovers on its own; AUTOLOAD_OPTIMIZE=true opts in.
 #   * Maintenance mode is entered ONLY when setup:upgrade has to run,
 #     and setup:upgrade runs ONLY when database changes are detected
 #     (setup:db:status, plus a fingerprint of db_schema.xml, module.xml
@@ -47,7 +57,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.1.1"
+DEPLOY_VERSION="3.2.0"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -178,7 +188,9 @@ BUILD_COPY_VENDOR="${BUILD_COPY_VENDOR:-false}"
 BUILD_ONLY="${BUILD_ONLY:-false}"
 PUSH_TARGET="${PUSH_TARGET:-}"
 PUSH_RUN="${PUSH_RUN:-false}"
-KEEP_PREVIOUS="${KEEP_PREVIOUS:-false}"
+AUTOLOAD_OPTIMIZE="${AUTOLOAD_OPTIMIZE:-false}"
+STORE_CHECK="${STORE_CHECK:-strict}"
+_RUN_ROLLBACK=false
 SKIP_COMPOSER="${SKIP_COMPOSER:-false}"
 SKIP_DB_CHECK="${SKIP_DB_CHECK:-false}"
 SKIP_STATIC="${SKIP_STATIC:-false}"
@@ -271,6 +283,8 @@ WARNING_COUNT=0
 CHILD_PID=""
 SWAPPED_ITEMS=()
 SCD_JOB_COUNT=0
+UPGRADE_STARTED=false
+FAILED_DIR=""
 
 # ───────────────────────────────────────────────────────────────────
 # Cross-platform system helpers
@@ -533,8 +547,24 @@ magento_cli() {
     magento_cli_in "${MAGENTO_CLI_ROOT:-$MAGENTO_DIR}" "$@"
 }
 
+# var/.regenerate makes Magento delete generated/ and var/cache on its next
+# bootstrap. The deployment installs freshly compiled code, so the flag
+# must never survive until a live bin/magento call: warn and drop it.
+regenerate_guard() {
+    local context="$1"
+    local flag="$MAGENTO_DIR/var/.regenerate"
+    [[ -e "$flag" && "$DRY_RUN" != "true" ]] || return 0
+    rm -f "$flag" "$MAGENTO_DIR/var/.regenerate.lock"
+    ui_warn "var/.regenerate appeared before $context - removed it (Magento would have wiped generated/ on that call; something on this host requests regeneration: composer plugins, module:enable, cron?)"
+}
+
 magento_cli_in() {
     local root="$1"; shift
+    if [[ "$root" == "$MAGENTO_DIR" && -e "$MAGENTO_DIR/var/.regenerate" && "$DRY_RUN" != "true" ]]; then
+        rm -f "$MAGENTO_DIR/var/.regenerate" "$MAGENTO_DIR/var/.regenerate.lock"
+        _file_log WARN "var/.regenerate appeared before 'bin/magento $1' - removed"
+        echo "  ${YELLOW}${SYM_WARN} var/.regenerate appeared before 'bin/magento $1' - removed${RESET}" >&2
+    fi
     if [[ -n "$PHP_MEMORY_LIMIT" ]]; then
         "$PHP_BIN" -d memory_limit="$PHP_MEMORY_LIMIT" "$root/bin/magento" "$@"
     else
@@ -692,7 +722,8 @@ USAGE:
     deploy.sh [OPTIONS]
 
 PIPELINE:
-    1. Preflight        validate config, PHP, composer, disk, memory, lock
+    1. Preflight        validate config, PHP, composer, disk, memory, lock,
+                        themes/locales vs the store views in the database
     2. Pre-deploy hook  PRE_DEPLOY_CMD (abort on failure)
     2b. Source          --ref/--git only: git fetch, export the ref into the
                         build clone; the live checkout is not touched
@@ -732,7 +763,12 @@ OPTIONS:
     --skip-db-check         Skip database/config checks and setup:upgrade
     --skip-static           Keep current static content
     --skip-di-compile       Keep current generated code
-    --keep-previous         Keep the replaced artifacts in var/deploy/previous
+    --rollback              Restore the previous release from var/deploy/previous
+                            (artifacts, and in git mode the code), reopen the site
+    --optimize-autoloader   composer dump-autoload --optimize --apcu in the build
+                            (see AUTOLOADER below)
+    --store-check MODE      strict (default): abort when a theme/locale used by a
+                            store view is missing from the config; warn; off
     --build-only            Stop after the build phase: artifacts stay in
                             var/deploy/build (generated/, pub/static/) for a
                             pipeline deployment on another host
@@ -768,6 +804,30 @@ GIT MODE (--ref / --git / GIT_REF):
       no working tree writes). Tracked entries removed by the new commit
       are retired, pub/media and var/ are never touched.
     BUILD_COPY_VENDOR=true copies vendor/ instead of hardlinking it.
+
+AUTOLOADER (AUTOLOAD_OPTIMIZE):
+    false (default) composer's plain autoloader: generated/ classes are found
+                    through PSR-0 lookups, missing ones are regenerated.
+    true            composer dump-autoload --optimize --apcu runs in the build
+                    after setup:di:compile and the classmap is swapped together
+                    with generated/. Faster autoloading, but if anything creates
+                    var/.regenerate later (composer install with the Magento
+                    installer plugin, module:enable, ...) Magento wipes
+                    generated/ on the next bootstrap and the classmap then
+                    points at missing files: the site goes down. The script
+                    removes that flag before every bin/magento call it makes and
+                    verifies the classmap after the swap (rolling back if it is
+                    broken), but it cannot protect against a flag created later.
+                    Enable it only where nobody runs composer/module commands
+                    on the live tree.
+
+ROLLBACK:
+    The release replaced by a deployment is kept in var/deploy/previous
+    (together with a manifest) until the next deployment. 'deploy.sh
+    --rollback' moves it back, drops var/.regenerate, flushes caches,
+    resets OPcache, disables maintenance mode and runs the health check.
+    The replaced files go to var/deploy/failed. A database upgrade is NOT
+    reverted: restore the DB_BACKUP dump yourself when setup:upgrade ran.
 
 DATABASE (DB_UPGRADE):
     auto    setup:upgrade runs when setup:db:status reports pending changes
@@ -823,7 +883,7 @@ ENVIRONMENT VARIABLES:
     PARALLEL_JOBS, FRONTEND_THEMES, BACKEND_THEME, FRONTEND_LANGUAGES,
     BACKEND_LANGUAGES, DB_UPGRADE, MAINTENANCE, MAINTENANCE_ALLOWED_IPS,
     GIT_REF, GIT_REMOTE, BUILD_COPY_VENDOR, SCD_EXTRA_ARGS, BUILD_DIR,
-    ARTIFACTS_DIR, BUILD_ONLY, KEEP_PREVIOUS, SKIP_COMPOSER, SKIP_DB_CHECK,
+    ARTIFACTS_DIR, BUILD_ONLY, AUTOLOAD_OPTIMIZE, STORE_CHECK, SKIP_COMPOSER, SKIP_DB_CHECK,
     SKIP_STATIC, SKIP_DI_COMPILE, VERBOSE, DRY_RUN, NO_INTERACTION,
     DEPLOY_ASCII, NO_COLOR, LOG_FILE, LOG_RETENTION_DAYS, PRE_DEPLOY_CMD,
     POST_DEPLOY_CMD, OPCACHE_RESET_CMD, HEALTHCHECK_URL,
@@ -838,6 +898,7 @@ EXAMPLES:
     deploy.sh -j 16 -v                        # 16 static-content processes, verbose
     deploy.sh --skip-static --skip-di-compile # Code-only deploy
     deploy.sh --db-upgrade always             # Force setup:upgrade
+    deploy.sh --rollback                      # Put the previous release back
     deploy.sh --build-only                    # Build artifacts here ...
     deploy.sh --artifacts /srv/build          # ... release them on the server
     deploy.sh --push www@shop:/var/www/html --push-run   # build here, release there
@@ -874,7 +935,9 @@ parse_arguments() {
             --skip-db-check)    SKIP_DB_CHECK=true; shift ;;
             --skip-static)      SKIP_STATIC=true; shift ;;
             --skip-di-compile)  SKIP_DI_COMPILE=true; shift ;;
-            --keep-previous)    KEEP_PREVIOUS=true; shift ;;
+            --rollback)         _RUN_ROLLBACK=true; shift ;;
+            --optimize-autoloader) AUTOLOAD_OPTIMIZE=true; shift ;;
+            --store-check)      _require_value "$1" $#; STORE_CHECK="$2"; shift 2 ;;
             --build-only)       BUILD_ONLY=true; shift ;;
             --artifacts)        _require_value "$1" $#; ARTIFACTS_DIR="$2"; shift 2 ;;
             --push)             _require_value "$1" $#; PUSH_TARGET="$2"; BUILD_ONLY=true; shift 2 ;;
@@ -912,6 +975,114 @@ confirm() {
     read -r answer || true
     answer="${answer:-$default}"
     [[ "$answer" =~ ^[Yy] ]]
+}
+
+# ───────────────────────────────────────────────────────────────────
+# Store design detection: themes and locales actually used by the
+# store views (and admin users), read from the database via env.php.
+# Prints THEME:<area>:<path>, LOCALE:<code>, ADMIN_LOCALE:<code> lines.
+# ───────────────────────────────────────────────────────────────────
+_store_detect_php() {
+    cat <<'PHPCODE'
+$env = @include $argv[1] . '/app/etc/env.php';
+if (!is_array($env)) { exit(1); }
+$db = isset($env['db']['connection']['default']) ? $env['db']['connection']['default'] : array();
+if (empty($db['host']) || empty($db['dbname'])) { exit(1); }
+$host = $db['host']; $port = isset($db['port']) ? $db['port'] : '';
+if ($port === '' && strpos($host, ':') !== false) { list($host, $port) = explode(':', $host, 2); }
+$dsn = 'mysql:host=' . $host;
+if ($port !== '') { $dsn .= ';port=' . $port; }
+$dsn .= ';dbname=' . $db['dbname'];
+$prefix = isset($db['table_prefix']) ? $db['table_prefix'] : '';
+try {
+    $options = array(PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5);
+    $pdo = new PDO($dsn, isset($db['username']) ? $db['username'] : '', isset($db['password']) ? $db['password'] : '', $options);
+    $stmt = $pdo->query("SELECT DISTINCT t.area, t.theme_path
+        FROM {$prefix}core_config_data c
+        JOIN {$prefix}theme t ON c.value = t.theme_id
+        WHERE c.path = 'design/theme/theme_id' AND c.value IS NOT NULL AND c.value <> ''");
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        echo 'THEME:' . $row['area'] . ':' . $row['theme_path'] . PHP_EOL;
+    }
+    $stmt = $pdo->query("SELECT DISTINCT value FROM {$prefix}core_config_data
+        WHERE path = 'general/locale/code' AND value IS NOT NULL AND value <> ''");
+    $locales = 0;
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        echo 'LOCALE:' . $row['value'] . PHP_EOL; $locales++;
+    }
+    if ($locales === 0) { echo 'LOCALE:en_US' . PHP_EOL; }
+    $stmt = $pdo->query("SELECT DISTINCT interface_locale FROM {$prefix}admin_user WHERE is_active = 1");
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        if (!empty($row['interface_locale'])) { echo 'ADMIN_LOCALE:' . $row['interface_locale'] . PHP_EOL; }
+    }
+} catch (Exception $e) {
+    exit(1);
+}
+PHPCODE
+}
+
+# Usage: detect_store_design ROOT  (exit 1 when the database is unreachable)
+detect_store_design() {
+    "$PHP_BIN" -r "$(_store_detect_php)" "$1" 2>/dev/null
+}
+
+# Compare FRONTEND_THEMES / *_LANGUAGES / BACKEND_THEME with what the
+# store views use. A theme or locale the shop needs but the deployment
+# would not build leaves the storefront without CSS/JS after the swap.
+validate_store_design() {
+    [[ "$STORE_CHECK" == "off" || "$SKIP_STATIC" == "true" ]] && return 0
+    [[ -f "$MAGENTO_DIR/app/etc/env.php" ]] || return 0
+
+    local output
+    if ! output="$(detect_store_design "$MAGENTO_DIR")"; then
+        ui_warn "Could not read themes/locales from the database - configured themes and locales are NOT verified"
+        return 0
+    fi
+
+    local fe_langs=() be_langs=() missing=() line theme locale found
+    split_list fe_langs "$FRONTEND_LANGUAGES"
+    split_list be_langs "$BACKEND_LANGUAGES"
+
+    while IFS= read -r line; do
+        case "$line" in
+            THEME:frontend:*)
+                theme="${line#THEME:frontend:}"
+                found=false
+                for t in ${FRONTEND_THEMES[@]+"${FRONTEND_THEMES[@]}"}; do [[ "$t" == "$theme" ]] && found=true; done
+                [[ "$found" == "true" ]] || missing+=("frontend theme $theme (FRONTEND_THEMES)")
+                ;;
+            THEME:adminhtml:*)
+                theme="${line#THEME:adminhtml:}"
+                [[ "$theme" == "$BACKEND_THEME" ]] || missing+=("backend theme $theme (BACKEND_THEME)")
+                ;;
+            LOCALE:*)
+                locale="${line#LOCALE:}"
+                found=false
+                for t in ${fe_langs[@]+"${fe_langs[@]}"}; do [[ "$t" == "$locale" ]] && found=true; done
+                [[ "$found" == "true" ]] || missing+=("store locale $locale (FRONTEND_LANGUAGES)")
+                ;;
+            ADMIN_LOCALE:*)
+                locale="${line#ADMIN_LOCALE:}"
+                found=false
+                for t in ${be_langs[@]+"${be_langs[@]}"}; do [[ "$t" == "$locale" ]] && found=true; done
+                [[ "$found" == "true" ]] || ui_warn "Admin locale $locale is used by an admin user but missing from BACKEND_LANGUAGES"
+                ;;
+        esac
+    done <<< "$output"
+
+    if (( ${#missing[@]} == 0 )); then
+        ui_ok "Themes and locales match the store views in the database"
+        return 0
+    fi
+    local item
+    for item in "${missing[@]}"; do
+        ui_fail "Store views use $item but the deployment would not build it"
+    done
+    if [[ "$STORE_CHECK" == "strict" ]]; then
+        ui_note "fix .deploy.env (or run deploy.sh --init), pass --frontend-themes/--frontend-langs, or use --store-check warn"
+        die "Configured themes/locales do not cover the store views - the storefront would break after the swap"
+    fi
+    ui_warn "Continuing although the storefront may lack assets after the swap (STORE_CHECK=warn)"
 }
 
 # ───────────────────────────────────────────────────────────────────
@@ -1020,6 +1191,10 @@ validate_configuration() {
         auto|always|never) ;;
         *) ui_warn "Invalid DB_UPGRADE '$DB_UPGRADE' (auto/always/never), using auto"; DB_UPGRADE=auto ;;
     esac
+    case "$STORE_CHECK" in
+        strict|warn|off) ;;
+        *) ui_warn "Invalid STORE_CHECK '$STORE_CHECK' (strict/warn/off), using strict"; STORE_CHECK=strict ;;
+    esac
     if ! [[ "$HEALTHCHECK_RETRIES" =~ ^[0-9]+$ ]] || (( HEALTHCHECK_RETRIES < 1 )); then
         ui_warn "Invalid HEALTHCHECK_RETRIES '$HEALTHCHECK_RETRIES', defaulting to 3"
         HEALTHCHECK_RETRIES=3
@@ -1086,6 +1261,7 @@ validate_configuration() {
     DEPLOY_STATE_DIR="$BUILD_DIR"
     BUILD_ROOT="$BUILD_DIR/build"
     PREVIOUS_DIR="$BUILD_DIR/previous"
+    FAILED_DIR="$BUILD_DIR/failed"
     if [[ -d "$MAGENTO_DIR" && -d "$MAGENTO_DIR/pub" ]]; then
         mkdir -p "$BUILD_DIR" 2>/dev/null || true
         local fs_build fs_pub
@@ -1146,6 +1322,7 @@ preflight() {
     local start=$SECONDS
     validate_configuration
     check_system_requirements
+    validate_store_design
     acquire_lock
     record_step_time "Preflight" $(( SECONDS - start ))
 }
@@ -1786,9 +1963,28 @@ di_compile() {
 # clone. vendor/composer and vendor/autoload.php are detached first so
 # composer cannot write through shared inodes into the live tree, and
 # are swapped into place together with generated/.
+# Check that every classmap entry pointing into generated/ exists.
+# Usage: verify_classmap ROOT  -> 0 ok, 1 missing files (listed on stdout)
+verify_classmap() {
+    local root="$1"
+    [[ -f "$root/vendor/composer/autoload_classmap.php" ]] || return 0
+    "$PHP_BIN" -r '
+        $map = @include $argv[1] . "/vendor/composer/autoload_classmap.php";
+        if (!is_array($map)) { exit(0); }
+        $missing = 0;
+        foreach ($map as $file) {
+            if (strpos($file, "/generated/") !== false && !is_file($file)) {
+                $missing++;
+                if ($missing <= 5) { echo $file, PHP_EOL; }
+            }
+        }
+        if ($missing > 0) { echo "MISSING=", $missing, PHP_EOL; exit(1); }
+    ' "$root" 2>/dev/null
+}
+
 dump_autoload_in_build() {
     if [[ "$SKIP_DI_COMPILE" == "true" ]]; then
-        ui_skip "composer dump-autoload --optimize" "(--skip-di-compile, current autoloader is kept)"
+        ui_skip "composer dump-autoload" "(--skip-di-compile, current autoloader is kept)"
         return 0
     fi
     local start=$SECONDS
@@ -1797,17 +1993,26 @@ dump_autoload_in_build() {
         detach_file vendor/autoload.php
         detach_file app/etc/NonComposerComponentRegistration.php
     fi
-    # --apcu is harmless without the extension: the ClassLoader only uses
-    # APCu when it is actually loaded at runtime. --no-plugins: plugin
-    # side effects already happened during the live composer install.
-    if ! run_cmd --label "composer dump-autoload --optimize --apcu (build)" -- \
-        composer_cli dump-autoload --optimize --apcu --no-plugins --no-interaction --working-dir="$BUILD_ROOT"; then
+    # --no-plugins: plugin side effects already happened during composer
+    # install. --apcu is harmless without the extension.
+    local args=(dump-autoload --no-plugins --no-interaction) label="composer dump-autoload (build)"
+    if [[ "$AUTOLOAD_OPTIMIZE" == "true" ]]; then
+        args+=(--optimize --apcu)
+        label="composer dump-autoload --optimize --apcu (build)"
+    fi
+    if ! run_cmd --label "$label" -- composer_cli "${args[@]}" --working-dir="$BUILD_ROOT"; then
         die "Composer dump-autoload failed"
     fi
-    if [[ "$DRY_RUN" != "true" && ! -f "$BUILD_ROOT/vendor/composer/autoload_classmap.php" ]]; then
-        die "composer dump-autoload finished but vendor/composer/autoload_classmap.php is missing in the build"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        [[ -f "$BUILD_ROOT/vendor/autoload.php" ]] \
+            || die "composer dump-autoload finished but vendor/autoload.php is missing in the build"
+        local check
+        if ! check="$(verify_classmap "$BUILD_ROOT")"; then
+            printf '%s\n' "$check" | sed 's/^/    /' >&2
+            die "The optimized classmap references generated files that do not exist in the build"
+        fi
     fi
-    record_step_time "Autoloader optimization" $(( SECONDS - start ))
+    record_step_time "Autoloader dump" $(( SECONDS - start ))
 }
 
 # Worker executed by xargs: one setup:static-content:deploy per job
@@ -2135,13 +2340,22 @@ swap_artifacts() {
         return 0
     fi
 
-    rm -rf "$PREVIOUS_DIR"
+    rm -rf "$PREVIOUS_DIR" "$FAILED_DIR"
     mkdir -p "$PREVIOUS_DIR"
+    {
+        echo "version=1"
+        echo "date=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "magento_dir=$MAGENTO_DIR"
+        echo "git_previous=$GIT_PREVIOUS_SHA"
+        echo "git_new=$GIT_SHA"
+    } > "$PREVIOUS_DIR/.manifest"
     for entry in "${items[@]}"; do
         swap_item "$entry"
+        echo "swapped $entry" >> "$PREVIOUS_DIR/.manifest"
     done
     for entry in ${RETIRE_CODE_ITEMS[@]+"${RETIRE_CODE_ITEMS[@]}"} ${retire[@]+"${retire[@]}"}; do
         retire_item "$entry"
+        echo "retired $entry" >> "$PREVIOUS_DIR/.manifest"
         SWAPPED_ITEMS+=("-$entry")
     done
     if [[ "$GIT_MODE" == "true" ]]; then
@@ -2160,8 +2374,68 @@ swap_artifacts() {
     ARTIFACTS_SWAPPED=true
 
     ui_ok "Swapped ${#SWAPPED_ITEMS[@]} artifacts into place: ${SWAPPED_ITEMS[*]}" "$(format_duration $(( SECONDS - start )))"
-    ui_note "previous versions kept in $(rel_path "$PREVIOUS_DIR") until the deployment is verified"
+    ui_note "previous release kept in $(rel_path "$PREVIOUS_DIR") (deploy.sh --rollback restores it)"
     record_step_time "Artifact swap" $(( SECONDS - start ))
+
+    verify_swap
+}
+
+# Sanity checks on the live tree right after the swap, before any
+# bin/magento call: a broken swap is rolled back automatically because
+# nothing irreversible (database) has happened yet.
+verify_swap() {
+    local problems=() check
+    if [[ "$SKIP_DI_COMPILE" != "true" ]]; then
+        [[ -d "$MAGENTO_DIR/generated/code" ]] && [[ -n "$(ls -A "$MAGENTO_DIR/generated/code" 2>/dev/null)" ]] \
+            || problems+=("generated/code is missing or empty")
+        [[ -f "$MAGENTO_DIR/vendor/autoload.php" ]] || problems+=("vendor/autoload.php is missing")
+    fi
+    if ! check="$(verify_classmap "$MAGENTO_DIR")"; then
+        problems+=("classmap references missing generated files: $(printf '%s ' "$check")")
+    fi
+    if (( ${#problems[@]} == 0 )); then
+        ui_ok "Swap verified: generated code, autoloader and classmap are consistent"
+        return 0
+    fi
+    local problem
+    for problem in "${problems[@]}"; do ui_fail "$problem"; done
+    rollback_swap
+    die "The swapped release is inconsistent - previous release restored, nothing else was changed"
+}
+
+# Undo swap_artifacts using the in-memory list (this run only)
+rollback_swap() {
+    CURRENT_STEP="Rolling back swap"
+    local entry rel i
+    mkdir -p "$FAILED_DIR"
+    for (( i = ${#SWAPPED_ITEMS[@]} - 1; i >= 0; i-- )); do
+        entry="${SWAPPED_ITEMS[$i]}"
+        rel="${entry#-}"
+        if [[ -e "$MAGENTO_DIR/$rel" ]]; then
+            mkdir -p "$FAILED_DIR/$(dirname "$rel")"
+            rm -rf "${FAILED_DIR:?}/$rel"
+            mv "$MAGENTO_DIR/$rel" "$FAILED_DIR/$rel" 2>/dev/null || rm -rf "${MAGENTO_DIR:?}/$rel"
+        fi
+        if [[ -e "$PREVIOUS_DIR/$rel" ]]; then
+            mkdir -p "$MAGENTO_DIR/$(dirname "$rel")"
+            mv "$PREVIOUS_DIR/$rel" "$MAGENTO_DIR/$rel" || ui_fail "Could not restore $rel from $(rel_path "$PREVIOUS_DIR")"
+        fi
+    done
+    [[ -e "$PREVIOUS_DIR/pub/static/_cache" ]] && mv "$PREVIOUS_DIR/pub/static/_cache" "$MAGENTO_DIR/pub/static/_cache" 2>/dev/null
+    if [[ "$GIT_MODE" == "true" && -n "$GIT_PREVIOUS_SHA" ]]; then
+        ( cd "$MAGENTO_DIR" && git reset -q --mixed "$GIT_PREVIOUS_SHA" 2>>"$LOG_FILE" ) \
+            || ui_warn "git reset to ${GIT_PREVIOUS_SHA:0:10} failed"
+    fi
+    rm -f "$MAGENTO_DIR/var/.regenerate" "$MAGENTO_DIR/var/.regenerate.lock"
+    rm -f "$PREVIOUS_DIR/.manifest"
+    ARTIFACTS_SWAPPED=false
+    SWAPPED_ITEMS=()
+    ui_ok "Previous release restored (the rejected files are in $(rel_path "$FAILED_DIR"))"
+    if [[ "$MAINTENANCE_ENABLED" == "true" ]]; then
+        run_cmd --label "maintenance:disable" -- magento_cli maintenance:disable \
+            && { MAINTENANCE_ENABLED=false; MAINTENANCE_REQUESTED=false; }
+    fi
+    return 0
 }
 
 run_setup_upgrade() {
@@ -2170,11 +2444,15 @@ run_setup_upgrade() {
     if [[ "$MAINTENANCE_REQUESTED" != "true" ]]; then
         ui_warn "Running setup:upgrade on a LIVE site (MAINTENANCE=$MAINTENANCE)"
     fi
+    regenerate_guard "setup:upgrade"
+    UPGRADE_STARTED=true
+    [[ -f "$PREVIOUS_DIR/.manifest" ]] && echo "upgrade started" >> "$PREVIOUS_DIR/.manifest"
     # Generated code was compiled from this exact code in the build phase
     if ! run_cmd --show-output --label "setup:upgrade --keep-generated" -- \
         magento_cli setup:upgrade --keep-generated --no-interaction; then
         die "setup:upgrade failed"
     fi
+    [[ -f "$PREVIOUS_DIR/.manifest" ]] && echo "upgrade done" >> "$PREVIOUS_DIR/.manifest"
     save_db_fingerprint
     record_step_time "Database upgrade" $(( SECONDS - start ))
 }
@@ -2203,9 +2481,10 @@ release_phase() {
     # Backup runs before the window so it does not add downtime
     [[ "$DB_UPGRADE_NEEDED" == "true" ]] && backup_database
 
-    [[ "$window" == "true" ]] && enable_maintenance
+    [[ "$window" == "true" ]] && { regenerate_guard "maintenance:enable"; enable_maintenance; }
     swap_artifacts
     run_setup_upgrade
+    regenerate_guard "cache:flush"
     flush_caches
     opcache_reset
     [[ "$window" == "true" ]] && disable_maintenance
@@ -2264,29 +2543,93 @@ post_deployment_checks() {
     record_step_time "Post-deployment checks" $(( SECONDS - start ))
 }
 
-# Remove the replaced artifacts once the new release is verified
-cleanup_previous_artifacts() {
-    [[ "$DRY_RUN" == "true" ]] && return 0
-    [[ -d "$PREVIOUS_DIR" ]] || return 0
-    if [[ "$KEEP_PREVIOUS" == "true" ]]; then
-        ui_note "previous artifacts kept in $(rel_path "$PREVIOUS_DIR") (--keep-previous)"
-        return 0
-    fi
-    local start=$SECONDS
-    rm -rf "$PREVIOUS_DIR" &
-    CHILD_PID=$!
-    _wait_with_spinner "$CHILD_PID" "Removing previous artifacts"
-    wait "$CHILD_PID" || true
-    CHILD_PID=""
-    ui_ok "Removed previous artifacts" "$(format_duration $(( SECONDS - start )))"
-}
-
 verify_phase() {
     ui_phase "Verify"
     health_check
     post_deployment_checks
-    cleanup_previous_artifacts
     [[ "$BUILD_ONLY" != "true" && "$DRY_RUN" != "true" ]] && rm -rf "$BUILD_ROOT"
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────────
+# --rollback: restore var/deploy/previous using its manifest
+# ───────────────────────────────────────────────────────────────────
+rollback_command() {
+    ui_phase "Rollback" "restoring $(rel_path "$PREVIOUS_DIR")"
+    local manifest="$PREVIOUS_DIR/.manifest"
+    [[ -d "$PREVIOUS_DIR" ]] || die "Nothing to roll back: $PREVIOUS_DIR does not exist"
+    [[ -f "$manifest" ]] || die "Nothing to roll back: $manifest is missing (already rolled back, or a pre-3.2 deployment)"
+
+    local line key value entries=() git_previous="" upgrade=""
+    while IFS= read -r line; do
+        case "$line" in
+            swapped\ *|retired\ *) entries+=("$line") ;;
+            git_previous=*) git_previous="${line#git_previous=}" ;;
+            "upgrade started") upgrade="started" ;;
+            "upgrade done") upgrade="done" ;;
+            date=*) ui_note "release replaced on ${line#date=}" ;;
+        esac
+    done < "$manifest"
+    (( ${#entries[@]} > 0 )) || die "The manifest lists nothing to restore"
+
+    local e
+    for e in "${entries[@]}"; do ui_note "$e"; done
+    [[ -n "$git_previous" ]] && ui_note "git HEAD will move back to ${git_previous:0:10}"
+    if [[ -n "$upgrade" ]]; then
+        ui_warn "setup:upgrade $upgrade in that deployment - the database is NOT reverted by this rollback; restore the DB_BACKUP dump if the schema changed"
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        ui_dry "Would restore the entries above, flush caches and disable maintenance mode"
+        return 0
+    fi
+    if ! confirm "Restore the previous release now?" y; then
+        die "Rollback aborted"
+    fi
+
+    local start=$SECONDS rel kind failed=0
+    rm -rf "$FAILED_DIR"
+    mkdir -p "$FAILED_DIR"
+    for (( i = ${#entries[@]} - 1; i >= 0; i-- )); do
+        kind="${entries[$i]%% *}"
+        rel="${entries[$i]#* }"
+        if [[ -e "$MAGENTO_DIR/$rel" ]]; then
+            mkdir -p "$FAILED_DIR/$(dirname "$rel")"
+            mv "$MAGENTO_DIR/$rel" "$FAILED_DIR/$rel" 2>/dev/null || rm -rf "${MAGENTO_DIR:?}/$rel"
+        fi
+        if [[ -e "$PREVIOUS_DIR/$rel" ]]; then
+            mkdir -p "$MAGENTO_DIR/$(dirname "$rel")"
+            if ! mv "$PREVIOUS_DIR/$rel" "$MAGENTO_DIR/$rel"; then
+                ui_fail "Could not restore $rel"; (( failed++ ))
+            fi
+        elif [[ "$kind" == "swapped" ]]; then
+            ui_warn "$rel is not in $(rel_path "$PREVIOUS_DIR") - skipped"
+        fi
+    done
+    [[ -e "$PREVIOUS_DIR/pub/static/_cache" && ! -e "$MAGENTO_DIR/pub/static/_cache" ]] \
+        && mv "$PREVIOUS_DIR/pub/static/_cache" "$MAGENTO_DIR/pub/static/_cache" 2>/dev/null
+    if [[ -n "$git_previous" && -e "$MAGENTO_DIR/.git" ]]; then
+        if ( cd "$MAGENTO_DIR" && git reset -q --mixed "$git_previous" 2>>"$LOG_FILE" ); then
+            ui_ok "git HEAD moved back to ${git_previous:0:10}"
+        else
+            ui_warn "git reset to ${git_previous:0:10} failed - run it manually"
+        fi
+    fi
+    rm -f "$manifest" "$MAGENTO_DIR/var/.regenerate" "$MAGENTO_DIR/var/.regenerate.lock"
+    (( failed == 0 )) || die "Rollback incomplete: $failed entries could not be restored"
+    ui_ok "Restored ${#entries[@]} entries (replaced files are in $(rel_path "$FAILED_DIR"))" "$(format_duration $(( SECONDS - start )))"
+    record_step_time "Rollback" $(( SECONDS - start ))
+
+    flush_caches
+    opcache_reset
+    local maint_status
+    maint_status="$(magento_cli maintenance:status 2>/dev/null || true)"
+    if [[ "$maint_status" == *"is active"* && "$maint_status" != *"not active"* ]]; then
+        MAINTENANCE_REQUESTED=true; MAINTENANCE_ENABLED=true; MAINTENANCE_START=$SECONDS
+        disable_maintenance
+    fi
+    ui_phase "Verify"
+    health_check
+    post_deployment_checks
     return 0
 }
 
@@ -2417,6 +2760,8 @@ CONFIGURATION:
   Backend langs:     $BACKEND_LANGUAGES
   Parallel jobs:     $PARALLEL_JOBS
   Memory limit:      ${PHP_MEMORY_LIMIT:-php.ini default}
+  Autoloader:        $([[ "$AUTOLOAD_OPTIMIZE" == "true" ]] && echo optimized || echo plain)
+  Store check:       $STORE_CHECK
   Maintenance:       $MAINTENANCE
   DB upgrade:        $DB_UPGRADE (ran: $DB_UPGRADE_NEEDED${DB_UPGRADE_REASON:+, reason: $DB_UPGRADE_REASON})
   Config import:     $CONFIG_IMPORT_NEEDED
@@ -2468,9 +2813,12 @@ display_summary() {
             echo "      $PHP_BIN $MAGENTO_DIR/bin/magento maintenance:disable"
         fi
         if [[ "$ARTIFACTS_SWAPPED" == "true" ]]; then
-            echo "  ${YELLOW}${SYM_WARN} New artifacts are already in place; the previous ones are in:${RESET}"
-            echo "      $PREVIOUS_DIR"
-            echo "    To restore them move each entry back (e.g. generated/code, pub/static/frontend)."
+            echo "  ${YELLOW}${SYM_WARN} The new release is already in place; the previous one is in $(rel_path "$PREVIOUS_DIR").${RESET}"
+            echo "    Put it back (and reopen the site) with:"
+            echo "      ${BASH_SOURCE[0]} --rollback${MAGENTO_DIR:+ --dir $MAGENTO_DIR}"
+            if [[ "$UPGRADE_STARTED" == "true" ]]; then
+                echo "    setup:upgrade already started: the database is not reverted by a rollback${LAST_BACKUP_FILE:+ (backup: $LAST_BACKUP_FILE)}."
+            fi
         elif [[ "$DEPLOYMENT_STARTED" == "true" && "$DRY_RUN" != "true" ]]; then
             if [[ "$COMPOSER_RAN" == "true" ]]; then
                 echo "  ${GREEN}${SYM_OK} Generated code and static content were not touched (composer install already ran in place).${RESET}"
@@ -2526,6 +2874,7 @@ display_config() {
     ui_kv "Parallel" "${PARALLEL_JOBS:-auto (CPU cores)} static-content processes"
     ui_kv "DB upgrade" "$DB_UPGRADE  ${DIM}(setup:upgrade only on database changes)${RESET}"
     ui_kv "Maintenance" "$MAINTENANCE  ${DIM}(auto = only while setup:upgrade runs)${RESET}"
+    ui_kv "Autoloader" "$([[ "$AUTOLOAD_OPTIMIZE" == "true" ]] && echo "optimized classmap + apcu" || echo "plain (AUTOLOAD_OPTIMIZE=false)")"
     if [[ -n "$GIT_REF" ]]; then
         ui_kv "Source" "git $GIT_REF ($GIT_REMOTE)  ${DIM}(live checkout untouched until the swap)${RESET}"
     else
@@ -2543,7 +2892,8 @@ display_config() {
     [[ "$SKIP_STATIC"     == "true" ]] && flags+=("skip-static")
     [[ "$SKIP_DI_COMPILE" == "true" ]] && flags+=("skip-di-compile")
     [[ "$BUILD_ONLY"      == "true" ]] && flags+=("build-only")
-    [[ "$KEEP_PREVIOUS"   == "true" ]] && flags+=("keep-previous")
+    [[ "$AUTOLOAD_OPTIMIZE" == "true" ]] && flags+=("optimize-autoloader")
+    [[ "$STORE_CHECK" != "strict" ]] && flags+=("store-check=$STORE_CHECK")
     [[ "$DRY_RUN"         == "true" ]] && flags+=("dry-run")
     [[ "$VERBOSE"         == "true" ]] && flags+=("verbose")
     (( ${#flags[@]} > 0 )) && ui_kv "Flags" "${YELLOW}${flags[*]}${RESET}"
@@ -2599,38 +2949,8 @@ generate_config_wizard() {
 
     echo
     echo "  ${YELLOW}Detecting themes and locales from the database...${RESET}"
-    local detect_php
-    read -r -d '' detect_php <<'PHPCODE' || true
-$env = @include $argv[1] . '/app/etc/env.php';
-if (!is_array($env)) { exit(1); }
-$db = isset($env['db']['connection']['default']) ? $env['db']['connection']['default'] : array();
-if (empty($db['host']) || empty($db['dbname'])) { exit(1); }
-$dsn = 'mysql:host=' . $db['host'];
-if (!empty($db['port'])) { $dsn .= ';port=' . $db['port']; }
-$dsn .= ';dbname=' . $db['dbname'];
-$prefix = isset($db['table_prefix']) ? $db['table_prefix'] : '';
-try {
-    $options = array(PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5);
-    $pdo = new PDO($dsn, isset($db['username']) ? $db['username'] : '', isset($db['password']) ? $db['password'] : '', $options);
-    $stmt = $pdo->query("SELECT DISTINCT t.area, t.theme_path
-        FROM {$prefix}core_config_data c
-        JOIN {$prefix}theme t ON c.value = t.theme_id
-        WHERE c.path = 'design/theme/theme_id' AND c.value IS NOT NULL");
-    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        echo 'THEME:' . $row['area'] . ':' . $row['theme_path'] . PHP_EOL;
-    }
-    $stmt = $pdo->query("SELECT DISTINCT value FROM {$prefix}core_config_data
-        WHERE path = 'general/locale/code' AND value IS NOT NULL");
-    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-        echo 'LOCALE:' . $row['value'] . PHP_EOL;
-    }
-} catch (Exception $e) {
-    exit(1);
-}
-PHPCODE
-
     local detect_output=""
-    detect_output="$("$php_bin" -r "$detect_php" "$mage_dir" 2>/dev/null)" || true
+    detect_output="$(PHP_BIN="$php_bin" detect_store_design "$mage_dir")" || true
 
     local frontend_themes=() locales=() backend_theme="Magento/backend" line
     if [[ -n "$detect_output" ]]; then
@@ -2841,6 +3161,18 @@ main() {
     DEPLOYMENT_STARTED=true
     _file_log INFO "Starting deployment (deploy.sh v$DEPLOY_VERSION, args: $*)"
 
+    if [[ "$_RUN_ROLLBACK" == "true" ]]; then
+        ui_phase "Preflight"
+        validate_configuration
+        acquire_lock
+        rollback_command
+        local rollback_duration=$(( SECONDS - DEPLOYMENT_START_TIME ))
+        generate_report "SUCCESS" "$rollback_duration"
+        display_summary "SUCCESS" "$rollback_duration"
+        _file_log OK "Rollback completed in $(format_duration "$rollback_duration")"
+        exit 0
+    fi
+
     preflight
     run_pre_deploy_hook
 
@@ -2888,6 +3220,7 @@ main() {
     local total_duration=$(( SECONDS - DEPLOYMENT_START_TIME ))
     generate_report "SUCCESS" "$total_duration"
     display_summary "SUCCESS" "$total_duration"
+    [[ "$ARTIFACTS_SWAPPED" == "true" ]] && ui_kv "Rollback" "${BASH_SOURCE[0]} --rollback  ${DIM}(previous release kept in $(rel_path "$PREVIOUS_DIR") until the next deployment)${RESET}"
     _file_log OK "Deployment completed successfully in $(format_duration "$total_duration") (downtime $(format_duration "$DOWNTIME_SECONDS"))"
     exit 0
 }

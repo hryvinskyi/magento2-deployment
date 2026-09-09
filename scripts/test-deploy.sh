@@ -46,7 +46,22 @@ while [[ "${1:-}" == "-d" ]]; do shift 2; done
 
 case "${1:-}" in
     -r)
-        if [[ "${2:-}" == *env.php* ]]; then
+        if [[ "${2:-}" == *design/theme/theme_id* ]]; then
+            # store design probe
+            [[ -n "${FAKE_STORE_DB_DOWN:-}" ]] && exit 1
+            for t in ${FAKE_STORE_THEMES:-frontend:Vendor/alpha frontend:Vendor/beta adminhtml:Magento/backend}; do echo "THEME:$t"; done
+            for l in ${FAKE_STORE_LOCALES:-en_GB de_DE}; do echo "LOCALE:$l"; done
+            for l in ${FAKE_ADMIN_LOCALES:-en_US}; do echo "ADMIN_LOCALE:$l"; done
+            exit 0
+        elif [[ "${2:-}" == *autoload_classmap* ]]; then
+            # classmap consistency probe ($3 = root)
+            if [[ -n "${FAKE_CLASSMAP_MISSING:-}" && "${3:-}" != */var/deploy/build ]]; then
+                echo "${3:-}/generated/code/Magento/Framework/App/ResourceConnection/Proxy.php"
+                echo "MISSING=1"
+                exit 1
+            fi
+            exit 0
+        elif [[ "${2:-}" == *env.php* ]]; then
             printf '%s\n' "fakedbhost:3307" "" "fakedb" "fakeuser" "fakepass"
         else
             echo -n "8.3.99"
@@ -130,7 +145,15 @@ case "$cmd" in
             echo "Upgrade failed"
             exit 1
         fi
+        if [[ -n "${FAKE_UPGRADE_FAILS_ON_FLAG:-}" && -e "$ROOT/var/.regenerate" ]]; then
+            echo "Warning: include(generated/code/.../Proxy.php): Failed to open stream (generated/ wiped by var/.regenerate)"
+            exit 1
+        fi
         echo "Upgrade ok"
+        ;;
+    maintenance:enable)
+        [[ "${FAKE_TOUCH_REGENERATE_ON:-}" == "maintenance:enable" ]] && touch "$ROOT/var/.regenerate"
+        echo "ok: $cmd"
         ;;
     maintenance:status)
         echo "Status: maintenance mode is not active"
@@ -243,9 +266,11 @@ setup_sandbox() {
     seed_fingerprint
     : > "$FAKE_LOG_FILE"
     unset FAKE_MODE FAKE_DB_STATUS FAKE_CONFIG_STATUS FAKE_FAIL_DI FAKE_FAIL_SCD FAKE_FAIL_UPGRADE FAKE_NO_METADATA \
+        FAKE_STORE_THEMES FAKE_STORE_LOCALES FAKE_ADMIN_LOCALES FAKE_STORE_DB_DOWN FAKE_CLASSMAP_MISSING \
+        FAKE_UPGRADE_FAILS_ON_FLAG FAKE_TOUCH_REGENERATE_ON AUTOLOAD_OPTIMIZE STORE_CHECK \
         FAKE_HTTP_CODE FAKE_SCD_SLEEP MAINTENANCE MAINTENANCE_ALLOWED_IPS DB_UPGRADE PRE_DEPLOY_CMD \
         POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
-        DB_BACKUP DB_BACKUP_CMD SCD_EXTRA_ARGS KEEP_PREVIOUS 2>/dev/null
+        DB_BACKUP DB_BACKUP_CMD SCD_EXTRA_ARGS 2>/dev/null
 }
 
 run_deploy() {
@@ -323,7 +348,10 @@ assert_order "install --no-dev" "setup:db:status" "composer before db check"
 assert_order "setup:db:status" "setup:di:compile" "db check before build"
 assert_order "setup:di:compile" "dump-autoload" "autoloader dumped AFTER compile"
 assert_order "dump-autoload" "static-content:deploy" "autoloader before static deploy"
-assert_grep "$FAKE_LOG_FILE" "dump-autoload --optimize --apcu --no-plugins --no-interaction --working-dir=.*var/deploy/build" "optimized classmap dumped in the build clone"
+assert_grep "$FAKE_LOG_FILE" "dump-autoload --no-plugins --no-interaction --working-dir=.*var/deploy/build" "plain autoloader dumped in the build clone"
+assert_not_grep "$FAKE_LOG_FILE" "dump-autoload.*--optimize" "classmap optimization is off by default"
+assert_grep "$OUT" "Themes and locales match the store views" "store design verified against the database"
+assert_grep "$OUT" "Swap verified" "post-swap verification ran"
 dump_calls="$(count_in_log 'dump-autoload')"
 assert_exit "$dump_calls" 1 "no optimized dump on the live tree"
 assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "dumped in .*var/deploy/build" "new classmap live"
@@ -347,7 +375,10 @@ assert_exists "$SANDBOX/generated/.htaccess" "generated/.htaccess preserved"
 assert_exists "$SANDBOX/vendor/magento/x/f.php" "vendor packages untouched"
 assert_missing "$SANDBOX/var/view_preprocessed/old.less" "old view_preprocessed replaced"
 assert_exists "$SANDBOX/pub/media/catalog/img.jpg" "media untouched"
-assert_missing "$PREVIOUS" "previous artifacts removed after verification"
+assert_exists "$PREVIOUS/pub/static/frontend/x/f.css" "previous release kept for rollback"
+assert_exists "$PREVIOUS/.manifest" "rollback manifest written"
+assert_grep "$PREVIOUS/.manifest" "^swapped generated/code" "manifest lists swapped entries"
+assert_grep "$OUT" "\-\-rollback" "rollback hint printed"
 assert_missing "$BUILD" "build clone removed after success"
 if command -v flock >/dev/null 2>&1; then
     if flock -n "$SANDBOX/var/.deploy.lock" true 2>/dev/null; then ok "lock released after success"; else bad "lock released after success [still held]"; fi
@@ -545,6 +576,7 @@ PHP_BIN=/bogus/php-from-config    # env var must override this
 PARALLEL_JOBS=3
 FRONTEND_THEMES="Cfg/theme"
 MAINTENANCE='never'
+STORE_CHECK=off
 CONF
 env PHP_BIN="$FAKEPHP" COMPOSER_BIN="$FAKECOMPOSER" FAKE_LOG="$FAKE_LOG_FILE" TMPDIR="$TMPDIR" \
     "$BASH_BIN" "$DEPLOY" --dir "$SANDBOX" --no-interaction --dry-run > "$OUT" 2>&1
@@ -554,6 +586,7 @@ assert_grep "$OUT" "PHP 8.3.99" "env PHP_BIN overrides config"
 assert_grep "$OUT" "3 static-content processes" "PARALLEL_JOBS read from config"
 assert_grep "$OUT" "Cfg/theme" "quoted theme value parsed"
 assert_grep "$OUT" "Maintenance     never" "single-quoted value parsed"
+assert_grep "$OUT" "store-check=off" "STORE_CHECK read from config"
 
 echo "=== T19: MAINTENANCE=always / never ==="
 setup_sandbox
@@ -672,18 +705,102 @@ run_deploy
 assert_exit $RC 1 "failed upgrade exits 1"
 assert_grep "$OUT" "Maintenance mode is still ENABLED" "warns maintenance left on"
 assert_grep "$OUT" "maintenance:disable" "prints manual disable command"
-assert_grep "$OUT" "previous ones are in" "points to previous artifacts"
+assert_grep "$OUT" "\-\-rollback" "points to the rollback command"
+assert_grep "$OUT" "database is not reverted" "warns that the upgrade started"
 assert_exists "$PREVIOUS/generated/code/Old/f.php" "previous generated code kept"
 assert_exists "$PREVIOUS/pub/static/frontend/x/f.css" "previous static content kept"
 assert_not_grep "$FAKE_LOG_FILE" "maintenance:disable" "maintenance NOT auto-disabled on failure"
 assert_missing "$SANDBOX/var/deploy/db-fingerprint.new" "no fingerprint side files"
 unset FAKE_DB_STATUS FAKE_FAIL_UPGRADE
 
-echo "=== T28: --keep-previous ==="
+echo "=== T28: --rollback after a failed setup:upgrade ==="
 setup_sandbox
-run_deploy --keep-previous
-assert_exit $RC 0 "keep-previous deploy exits 0"
-assert_exists "$PREVIOUS/pub/static/frontend/x/f.css" "previous static kept on request"
+export FAKE_DB_STATUS=2 FAKE_FAIL_UPGRADE=1
+run_deploy
+assert_exit $RC 1 "failed upgrade exits 1"
+assert_grep "$PREVIOUS/.manifest" "^upgrade started" "manifest records the started upgrade"
+unset FAKE_DB_STATUS FAKE_FAIL_UPGRADE
+: > "$FAKE_LOG_FILE"
+run_deploy --rollback
+assert_exit $RC 0 "rollback exits 0"
+assert_grep "$OUT" "Restored" "rollback reports restored entries"
+assert_grep "$OUT" "database is NOT reverted" "rollback warns about the database"
+assert_exists "$SANDBOX/generated/code/Old/f.php" "old generated code restored"
+assert_exists "$SANDBOX/pub/static/frontend/x/f.css" "old static content restored"
+assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "old live classmap" "old classmap restored"
+assert_exists "$SANDBOX/var/deploy/failed/generated/code/Fake/Interceptor.php" "rejected release moved to failed/"
+assert_missing "$PREVIOUS/.manifest" "manifest consumed"
+assert_grep "$FAKE_LOG_FILE" "cache:flush" "rollback flushes caches"
+assert_grep "$FAKE_LOG_FILE" "maintenance:status" "rollback checks maintenance mode"
+assert_not_grep "$FAKE_LOG_FILE" "setup:di:compile" "rollback builds nothing"
+run_deploy --rollback
+assert_exit $RC 1 "second rollback refused"
+assert_grep "$OUT" "Nothing to roll back" "explains there is nothing to roll back"
+
+echo "=== T28b: broken classmap after the swap rolls back automatically ==="
+setup_sandbox
+export FAKE_DB_STATUS=2 FAKE_CLASSMAP_MISSING=1 AUTOLOAD_OPTIMIZE=true
+run_deploy
+assert_exit $RC 1 "inconsistent swap fails"
+assert_grep "$FAKE_LOG_FILE" "dump-autoload --no-plugins --no-interaction --optimize --apcu" "optimized dump requested"
+assert_grep "$OUT" "classmap references missing generated files" "problem named"
+assert_grep "$OUT" "Previous release restored" "automatic rollback"
+assert_exists "$SANDBOX/generated/code/Old/f.php" "old generated code back in place"
+assert_exists "$SANDBOX/pub/static/frontend/x/f.css" "old static back in place"
+assert_not_grep "$FAKE_LOG_FILE" "setup:upgrade" "setup:upgrade never ran"
+assert_order "maintenance:enable" "maintenance:disable" "maintenance window closed by the rollback"
+assert_grep "$OUT" "live site was not touched\|Previous release restored" "summary reflects restored state"
+unset FAKE_DB_STATUS FAKE_CLASSMAP_MISSING AUTOLOAD_OPTIMIZE
+
+echo "=== T28c: var/.regenerate created mid-release is removed before setup:upgrade ==="
+setup_sandbox
+export FAKE_DB_STATUS=2 FAKE_TOUCH_REGENERATE_ON=maintenance:enable FAKE_UPGRADE_FAILS_ON_FLAG=1
+run_deploy
+assert_exit $RC 0 "deploy survives a mid-release regenerate flag"
+assert_grep "$OUT" "var/.regenerate appeared before setup:upgrade" "guard reports the flag"
+assert_missing "$SANDBOX/var/.regenerate" "flag gone at the end"
+unset FAKE_DB_STATUS FAKE_TOUCH_REGENERATE_ON FAKE_UPGRADE_FAILS_ON_FLAG
+
+echo "=== T28d: themes/locales are checked against the store views ==="
+setup_sandbox
+export FAKE_STORE_THEMES="frontend:Vendor/alpha frontend:Megnor/mag100224 adminhtml:Magento/backend"
+run_deploy
+assert_exit $RC 1 "missing store theme aborts"
+assert_grep "$OUT" "frontend theme Megnor/mag100224" "missing theme named"
+assert_not_grep "$FAKE_LOG_FILE" "install --no-dev" "aborts before composer"
+assert_exists "$SANDBOX/pub/static/frontend/x/f.css" "live static untouched"
+run_deploy --store-check warn
+assert_exit $RC 0 "STORE_CHECK=warn continues"
+assert_grep "$OUT" "may lack assets" "warns instead"
+run_deploy --frontend-themes "Vendor/alpha,Vendor/beta,Megnor/mag100224"
+assert_exit $RC 0 "adding the theme fixes it"
+unset FAKE_STORE_THEMES
+setup_sandbox
+export FAKE_STORE_LOCALES="en_GB fr_FR"
+run_deploy --dry-run
+assert_exit $RC 1 "missing store locale aborts (also in dry run)"
+assert_grep "$OUT" "store locale fr_FR" "missing locale named"
+unset FAKE_STORE_LOCALES
+setup_sandbox
+export FAKE_ADMIN_LOCALES="en_US uk_UA"
+run_deploy --skip-static --skip-di-compile
+assert_exit $RC 0 "admin locale mismatch is only a warning"
+setup_sandbox
+export FAKE_ADMIN_LOCALES="en_US uk_UA"
+run_deploy
+assert_grep "$OUT" "Admin locale uk_UA" "admin locale warning"
+unset FAKE_ADMIN_LOCALES
+setup_sandbox
+export FAKE_STORE_DB_DOWN=1
+run_deploy
+assert_exit $RC 0 "unreachable database only warns"
+assert_grep "$OUT" "NOT verified" "explains the skipped check"
+unset FAKE_STORE_DB_DOWN
+setup_sandbox
+export FAKE_STORE_THEMES="frontend:Other/theme"
+run_deploy --store-check off --skip-static --skip-di-compile
+assert_exit $RC 0 "STORE_CHECK=off skips the check"
+unset FAKE_STORE_THEMES
 
 echo "=== T29: --build-only produces artifacts without releasing ==="
 setup_sandbox
