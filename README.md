@@ -538,6 +538,8 @@ CI (`.github/workflows/ci.yml`) runs ShellCheck, the test suite on Ubuntu (flock
 
 **`Path "..." cannot be used with directory "..."` during static content deployment.** A module or theme is registered from a path outside the Magento root (symlinked module). Move it inside the root; the build clone requires real files or hardlinks, not symlinks to other locations.
 
+**A composer package silently stopped autoloading after a successful deployment.** Composer installs a package from a `path` repository as a relative symlink out of `vendor/` (`vendor/acme/sdk -> ../../composer/acme/sdk`), so its source lives outside the directories the build clone copies. Until 3.2.1 the link dangled in the build and `composer dump-autoload` dropped the package from the autoloader with a zero exit code — the deployment reported success and the classes were gone. Since 3.2.1 the clone carries those sources, and the build aborts if its autoloader registers fewer namespaces than the live one. A path repository whose source sits *outside* the Magento root still cannot be carried; the run warns about it, and the fix is to move it inside the root.
+
 **The shop still serves old code after the release.** php-fpm runs with `opcache.validate_timestamps=0`. Set `OPCACHE_RESET_CMD` (`cachetool opcache:reset`, or a php-fpm reload).
 
 **Maintenance mode is still on after a failure.** That is intentional after a failed `setup:upgrade`. Fix, rerun or restore from `var/deploy/previous`, then `bin/magento maintenance:disable`.

@@ -57,7 +57,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.2.0"
+DEPLOY_VERSION="3.2.1"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -1788,6 +1788,78 @@ carry_untracked_files() {
     rm -f "$list"
 }
 
+# Composer installs a path repository as a relative symlink that points
+# back out of vendor/ (vendor/ced/walmart-sdk -> ../../composer/ced/sdk).
+# The sources those links point at are not part of the entries the clone
+# copies, so in the build the links dangle - and `composer dump-autoload`
+# then drops those packages from the autoloader without a word and with a
+# zero exit code, taking their classes down with it after the swap.
+# Prints one source path per line, relative to MAGENTO_DIR; a leading "!"
+# marks a link whose target the build cannot reach at all.
+list_path_repository_sources() {
+    [[ -d "$MAGENTO_DIR/vendor" ]] || return 0
+    "$PHP_BIN" -r '
+        $root = realpath($argv[1]);
+        $vendor = $root === false ? false : realpath($root . "/vendor");
+        if ($vendor === false) { exit(0); }
+        $children = function ($dir) {
+            $list = @scandir($dir);
+            return is_array($list) ? array_diff($list, [".", ".."]) : [];
+        };
+        $links = [];
+        foreach ($children($vendor) as $a) {
+            $pa = $vendor . "/" . $a;
+            if (is_link($pa)) { $links[] = $pa; continue; }
+            if (!is_dir($pa)) { continue; }
+            foreach ($children($pa) as $b) {
+                $pb = $pa . "/" . $b;
+                if (is_link($pb)) { $links[] = $pb; }
+            }
+        }
+        $sources = [];
+        $outside = [];
+        foreach ($links as $link) {
+            $target = readlink($link);
+            // an absolute link resolves to the same place from the build
+            if ($target === false || $target === "" || $target[0] === "/") { continue; }
+            $real = realpath(dirname($link) . "/" . $target);
+            if ($real === false || !is_dir($real)) { continue; }
+            if (strpos($real . "/", $vendor . "/") === 0) { continue; }
+            if (strpos($real . "/", $root . "/") === 0) {
+                $sources[substr($real, strlen($root) + 1)] = true;
+            } else {
+                $outside[substr($link, strlen($vendor) + 1)] = true;
+            }
+        }
+        foreach (array_keys($sources) as $rel) { echo $rel, PHP_EOL; }
+        foreach (array_keys($outside) as $rel) { echo "!vendor/", $rel, PHP_EOL; }
+    ' "$MAGENTO_DIR" 2>/dev/null
+}
+
+# Clone the path-repository sources the build does not have yet (in git
+# mode the exported tree already carries the tracked ones)
+carry_path_repository_sources() {
+    local rel count=0
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        if [[ "$rel" == '!'* ]]; then
+            ui_warn "composer path repository ${rel#!} points outside the Magento root - the build cannot reach it and its classes will be missing from the autoloader"
+            continue
+        fi
+        if [[ "$DRY_RUN" == "true" ]]; then
+            ui_dry "Would clone composer path repository $rel into $(rel_path "$BUILD_ROOT")"
+            continue
+        fi
+        [[ -e "$BUILD_ROOT/$rel" ]] && continue
+        mkdir -p "$BUILD_ROOT/$(dirname "$rel")"
+        clone_path "$MAGENTO_DIR/$rel" "$BUILD_ROOT/$rel" \
+            || die "Failed to clone composer path repository $rel into the build directory"
+        count=$(( count + 1 ))
+    done < <(list_path_repository_sources)
+    (( count > 0 )) && ui_note "carried $count composer path-repository source(s) into the build"
+    return 0
+}
+
 # Which top-level entries will be swapped in git mode: every tracked
 # top-level entry of the new commit except runtime data, plus pub/*
 # except media and static. Tracked entries that disappeared are retired.
@@ -1880,6 +1952,8 @@ source_phase() {
         ui_note "merged live vendor/ into the build ($CLONE_MODE)"
     fi
     carry_untracked_files
+    # path repositories the exported commit does not track
+    carry_path_repository_sources
     # env.php is the live one, always
     if [[ -f "$MAGENTO_DIR/app/etc/env.php" ]]; then
         mkdir -p "$BUILD_ROOT/app/etc"
@@ -1906,6 +1980,7 @@ create_build_clone() {
 
     if [[ "$DRY_RUN" == "true" ]]; then
         ui_dry "Would clone ${entries[*]} into $(rel_path "$BUILD_ROOT")"
+        carry_path_repository_sources
         return 0
     fi
 
@@ -1918,6 +1993,10 @@ create_build_clone() {
         clone_path "$MAGENTO_DIR/$entry" "$BUILD_ROOT/$entry" \
             || die "Failed to clone $entry into the build directory"
     done
+
+    # vendor/ alone is not the whole package tree: path repositories live
+    # outside it and the symlinks in vendor/ would dangle without them
+    carry_path_repository_sources
 
     # Files Magento may rewrite in place must not share inodes with live
     detach_file app/etc/env.php
@@ -1982,6 +2061,37 @@ verify_classmap() {
     ' "$root" 2>/dev/null
 }
 
+# Namespaces the live autoloader registers and the build's does not.
+# Outside git mode the build's vendor/ is a clone of the live one, so both
+# dumps describe the same installed packages - anything missing here was
+# lost by the build (a path repository the clone did not carry), never
+# removed from composer.json. An autoloader that quietly forgets a package
+# breaks it only at runtime, long after the deployment reports success.
+# Usage: missing_autoload_namespaces LIVE BUILD -> 0 ok, 1 missing (listed)
+missing_autoload_namespaces() {
+    "$PHP_BIN" -r '
+        $read = function ($root) {
+            $found = [];
+            foreach (["autoload_psr4.php", "autoload_namespaces.php"] as $file) {
+                $path = $root . "/vendor/composer/" . $file;
+                if (!is_file($path)) { continue; }
+                $map = @include $path;
+                if (!is_array($map)) { continue; }
+                foreach (array_keys($map) as $ns) { $found[$ns] = true; }
+            }
+            return $found;
+        };
+        $live = $read($argv[1]);
+        $build = $read($argv[2]);
+        if (!$live || !$build) { exit(0); }
+        $missing = array_keys(array_diff_key($live, $build));
+        if (!$missing) { exit(0); }
+        foreach (array_slice($missing, 0, 5) as $ns) { echo $ns, PHP_EOL; }
+        echo "MISSING=", count($missing), PHP_EOL;
+        exit(1);
+    ' "$1" "$2" 2>/dev/null
+}
+
 dump_autoload_in_build() {
     if [[ "$SKIP_DI_COMPILE" == "true" ]]; then
         ui_skip "composer dump-autoload" "(--skip-di-compile, current autoloader is kept)"
@@ -2010,6 +2120,13 @@ dump_autoload_in_build() {
         if ! check="$(verify_classmap "$BUILD_ROOT")"; then
             printf '%s\n' "$check" | sed 's/^/    /' >&2
             die "The optimized classmap references generated files that do not exist in the build"
+        fi
+        # In git mode composer install ran in the build, so its package set
+        # is the new one and may legitimately be smaller than the live one
+        local lost
+        if [[ "$GIT_MODE" != "true" ]] && ! lost="$(missing_autoload_namespaces "$MAGENTO_DIR" "$BUILD_ROOT")"; then
+            printf '%s\n' "$lost" | sed 's/^/    /' >&2
+            die "The build autoloader lost namespaces the live one registers - a composer path repository is probably missing from the build clone"
         fi
     fi
     record_step_time "Autoloader dump" $(( SECONDS - start ))
