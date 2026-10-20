@@ -81,6 +81,14 @@ case "$script" in
     *composer*)
         wd=""
         for a in "$@"; do [[ "$a" == --working-dir=* ]] && wd="${a#--working-dir=}"; done
+        if [[ "${1:-}" == "install" && -n "$wd" && -n "${FAKE_COMPOSER_REINSTALL:-}" ]]; then
+            # like composer (and a patch plugin): the package directory is
+            # removed and extracted again, so its files get new inodes
+            rm -rf "$wd/vendor/magento/x"
+            mkdir -p "$wd/vendor/magento/x" "$wd/vendor/magento/added"
+            echo "<?php // installed in $wd" > "$wd/vendor/magento/x/f.php"
+            echo "<?php // added in $wd" > "$wd/vendor/magento/added/f.php"
+        fi
         if [[ "${1:-}" == "dump-autoload" && -n "$wd" ]]; then
             mkdir -p "$wd/vendor/composer"
             echo "<?php // classmap dumped in $wd" > "$wd/vendor/composer/autoload_classmap.php"
@@ -267,9 +275,9 @@ setup_sandbox() {
     : > "$FAKE_LOG_FILE"
     unset FAKE_MODE FAKE_DB_STATUS FAKE_CONFIG_STATUS FAKE_FAIL_DI FAKE_FAIL_SCD FAKE_FAIL_UPGRADE FAKE_NO_METADATA \
         FAKE_STORE_THEMES FAKE_STORE_LOCALES FAKE_ADMIN_LOCALES FAKE_STORE_DB_DOWN FAKE_CLASSMAP_MISSING \
-        FAKE_UPGRADE_FAILS_ON_FLAG FAKE_TOUCH_REGENERATE_ON AUTOLOAD_OPTIMIZE STORE_CHECK \
+        FAKE_UPGRADE_FAILS_ON_FLAG FAKE_TOUCH_REGENERATE_ON FAKE_COMPOSER_REINSTALL AUTOLOAD_OPTIMIZE STORE_CHECK \
         FAKE_HTTP_CODE FAKE_SCD_SLEEP MAINTENANCE MAINTENANCE_ALLOWED_IPS DB_UPGRADE PRE_DEPLOY_CMD \
-        POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
+        POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RESOLVE HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
         DB_BACKUP DB_BACKUP_CMD SCD_EXTRA_ARGS 2>/dev/null
 }
 
@@ -980,6 +988,47 @@ run_deploy --git --skip-static --skip-di-compile
 assert_exit $RC 0 "--git uses the upstream"
 assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$NEW_SHA" "--git deployed the upstream commit"
 assert_grep "$SANDBOX/app/code/Vendor/Module/Thing.php" "version 2" "code swapped even without artifacts"
+
+echo "=== T30g: git mode releases the vendor/ the build installed (vendor/ not tracked) ==="
+setup_git_sandbox
+echo "<?php // live package" > "$SANDBOX/vendor/magento/x/f.php"
+export FAKE_COMPOSER_REINSTALL=1
+run_deploy --ref origin/master
+assert_exit $RC 0 "git deploy with a reinstalled package exits 0"
+assert_grep "$SANDBOX/vendor/magento/x/f.php" "installed in .*var/deploy/build" "package reinstalled in the build is live (generated code was compiled against it)"
+assert_exists "$SANDBOX/vendor/magento/added/f.php" "package added in the build is live"
+assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "dumped in .*var/deploy/build" "classmap released with its vendor/"
+assert_grep "$PREVIOUS/vendor/magento/x/f.php" "live package" "previous vendor/ kept for rollback"
+assert_grep "$PREVIOUS/.manifest" "^swapped vendor$" "vendor/ recorded in the manifest"
+assert_not_grep "$PREVIOUS/.manifest" "^swapped vendor/" "nothing inside the swapped vendor/ recorded separately"
+assert_missing "$BUILD" "build directory cleaned up"
+run_deploy --rollback
+assert_exit $RC 0 "rollback of a vendor release exits 0"
+assert_grep "$SANDBOX/vendor/magento/x/f.php" "live package" "rollback restores the previous vendor/"
+assert_missing "$SANDBOX/vendor/magento/added" "rollback removes the package the release added"
+assert_grep "$SANDBOX/vendor/composer/autoload_classmap.php" "old live classmap" "rollback restores the classmap inside vendor/"
+assert_exit "$(git -C "$SANDBOX" rev-parse HEAD)" "$OLD_SHA" "rollback moves HEAD back"
+unset FAKE_COMPOSER_REINSTALL
+setup_git_sandbox
+run_deploy --ref origin/master --dry-run
+assert_grep "$OUT" "Would swap: .*vendor" "dry run lists vendor/ in the code swap"
+setup_git_sandbox
+mkdir -p "$PREVIOUS/vendor/magento/old" "$SANDBOX/var/deploy/failed.discard.123"
+echo "version=1" > "$PREVIOUS/.manifest"
+run_deploy --ref origin/master
+assert_exit $RC 0 "git deploy over an older previous release exits 0"
+assert_missing "$PREVIOUS/vendor/magento/old" "older previous release replaced"
+leftovers="$(find "$SANDBOX/var/deploy" -maxdepth 1 -name '*.discard.*' | wc -l | tr -d ' ')"
+assert_exit "$leftovers" 0 "discarded releases purged after the release (and leftovers of failed runs)"
+
+echo "=== T30h: health check through HEALTHCHECK_RESOLVE ==="
+setup_sandbox
+export HEALTHCHECK_URL='https://shop.example.test/' HEALTHCHECK_RESOLVE='shop.example.test:443:10.0.0.5'
+run_deploy --skip-static --skip-di-compile
+assert_exit $RC 0 "deploy with a resolved health check exits 0"
+assert_grep "$FAKE_LOG_FILE" "CURL .*--resolve shop.example.test:443:10.0.0.5 .*https://shop.example.test/" "health check pinned to the origin with --resolve"
+assert_grep "$OUT" "via 10.0.0.5" "summary names the pinned address"
+unset HEALTHCHECK_URL HEALTHCHECK_RESOLVE
 
 echo "=== T31: developer mode is switched to production ==="
 setup_sandbox

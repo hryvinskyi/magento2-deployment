@@ -164,7 +164,7 @@ From here on the build directory is a complete, self-contained copy of the new r
 
 ### 3. Composer
 
-`composer install --no-dev --no-interaction --no-progress --prefer-dist` runs from `composer.lock` (a missing lock file aborts). In **git mode** it runs inside the build (`--working-dir=var/deploy/build`), the live `vendor/` is untouched. In **in-place mode** it runs live; the shop keeps serving because Composer replaces packages atomically per file and OPcache keeps the old bytecode until it is reset.
+`composer install --no-dev --no-interaction --no-progress --prefer-dist` runs from `composer.lock` (a missing lock file aborts). In **git mode** it runs inside the build (`--working-dir=var/deploy/build`), the live `vendor/` is untouched until the release, where the build's `vendor/` replaces it as a whole: the generated code is compiled against exactly that tree, so it goes live even when `.gitignore` excludes `vendor/`. In **in-place mode** it runs live; the shop keeps serving because Composer replaces packages atomically per file and OPcache keeps the old bytecode until it is reset.
 
 Composer writes a **plain** autoloader here. The optimized classmap is deliberately **not** generated at this point: `composer dump-autoload --optimize` hard-codes every file in `generated/code`, and that directory is about to be replaced. See phase 5.
 
@@ -225,12 +225,12 @@ The phase header says whether a maintenance window will be used and why.
 1. **Database backup** (when `setup:upgrade` will run and `DB_BACKUP=true` or `DB_BACKUP_CMD` is set). It runs **before** the maintenance window so it does not add downtime. The built-in backup reads the credentials from `app/etc/env.php` (`host:port` notation supported) and writes a gzipped `mysqldump --single-transaction` into `var/backups/deploy_db_<timestamp>.sql.gz`.
 2. **Maintenance mode** is enabled only when `setup:upgrade` will run (`MAINTENANCE=auto`) or when `MAINTENANCE=always`. `MAINTENANCE_ALLOWED_IPS` are passed as `--ip` options.
 3. **Swap.** For every entry the live one is moved to `var/deploy/previous/<path>` and the built one is moved into place:
-   - in git mode first the code: `app`, `bin`, `lib`, `setup`, `vendor`, `composer.json`, `composer.lock`, every other tracked top-level entry, and `pub/*` except `media` and `static`; tracked entries removed by the new commit are retired;
+   - in git mode first the code: `app`, `bin`, `lib`, `setup`, `vendor` (always, tracked or not, with `vendor/composer` and `vendor/autoload.php` inside it), `composer.json`, `composer.lock`, every other tracked top-level entry, and `pub/*` except `media` and `static`; tracked entries removed by the new commit are retired;
    - every entry under the build's `generated/` except `.htaccess` (`code`, `metadata`, `staticcache`, ...), `vendor/composer`, `vendor/autoload.php` (when compiled); live entries under `generated/` that the new compile did not produce are retired, so a stale `metadata` cannot survive a switch to another compiler;
    - `var/view_preprocessed` and every entry of the clone's `pub/static/` except `.htaccess` — normally `frontend`, `adminhtml`, `deployed_version.txt` (when static content was deployed);
    - `pub/static/_cache` (merged/minified bundles built from the old sources) is retired, it is regenerated on demand.
    Each swap is two renames; the gap between them is microseconds. If the second rename fails the previous version is restored immediately. A manifest of every swapped and retired entry is written to `var/deploy/previous/.manifest` for `--rollback`.
-   **Verification.** Right after the swap and before any `bin/magento` call, the live tree is checked: `generated/code` exists and is not empty, `vendor/autoload.php` exists, and every classmap entry that points into `generated/` resolves to a file. If anything is wrong the swap is undone automatically (the rejected files go to `var/deploy/failed`), maintenance mode is disabled again and the run fails; nothing irreversible has happened at that point. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
+   **Verification.** Right after the swap and before any `bin/magento` call, the live tree is checked: `generated/code` exists and is not empty, `vendor/autoload.php` exists, every classmap entry that points into `generated/` resolves to a file, and in git mode the build's `vendor/` went live. If anything is wrong the swap is undone automatically (the rejected files go to `var/deploy/failed`), maintenance mode is disabled again and the run fails; nothing irreversible has happened at that point. The `.htaccess`, `pagespeed_cache` and any other custom entries under `pub/static` stay where they are. In git mode the live `.git` is then moved to the deployed commit with `git reset --mixed <commit>`, which updates `HEAD`, the branch and the index but writes nothing into the working tree (it already matches).
 4. **`setup:upgrade --keep-generated --no-interaction`** runs when required. `--keep-generated` is correct here because the generated code was compiled from exactly this code in the build phase. On success the database fingerprint is stored.
 5. **`cache:flush`** (a failure only warns).
 6. **OPcache reset** via `OPCACHE_RESET_CMD`. With `opcache.validate_timestamps=0` php-fpm keeps serving the previous release from OPcache until it is reset or reloaded; without the command a reminder is printed.
@@ -238,7 +238,7 @@ The phase header says whether a maintenance window will be used and why.
 
 ### 7. Verify
 
-- **Health check**: `curl` fetches `HEALTHCHECK_URL` (redirects followed) up to `HEALTHCHECK_RETRIES` times with `HEALTHCHECK_TIMEOUT` seconds each; anything but HTTP 2xx fails the deployment.
+- **Health check**: `curl` fetches `HEALTHCHECK_URL` (redirects followed) up to `HEALTHCHECK_RETRIES` times with `HEALTHCHECK_TIMEOUT` seconds each; anything but HTTP 2xx fails the deployment. Behind a CDN or WAF (Cloudflare, Fastly, a bot challenge) the edge may answer instead of the shop, in either direction: a 403 challenge for a healthy release, or a cached 200 for a broken one. Set `HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5` to send the request straight to the origin (`curl --resolve`); the hostname, TLS name and `Host` header stay the same.
 - **Post-deployment checks**: file counts of `generated/code`, `generated/metadata`, `pub/static`, presence of `pub/static/deployed_version.txt`, application mode, maintenance status.
 - The build clone is removed. The previous release stays in `var/deploy/previous` until the next deployment replaces it, so `--rollback` remains possible after a deployment that verified fine but turns out to be bad.
 
@@ -392,6 +392,7 @@ Set in `.deploy.env` (KEY=VALUE, `#` comments, quotes optional) or the environme
 | `POST_DEPLOY_CMD` | empty | Hook after success; failure warns. |
 | `OPCACHE_RESET_CMD` | empty | Runs right after the swap. Required with `opcache.validate_timestamps=0`. |
 | `HEALTHCHECK_URL` | empty | URL expected to return HTTP 2xx after the release. |
+| `HEALTHCHECK_RESOLVE` | empty | `host:port:address` for `curl --resolve`: sends the health check to the origin server instead of a CDN/WAF in front of it. |
 | `HEALTHCHECK_RETRIES` | `3` | Attempts. |
 | `HEALTHCHECK_TIMEOUT` | `30` | Seconds per attempt. |
 | `DB_BACKUP` | `false` | Built-in mysqldump before `setup:upgrade`. |
@@ -537,6 +538,8 @@ CI (`.github/workflows/ci.yml`) runs ShellCheck, the test suite on Ubuntu (flock
 **Static content jobs run out of memory.** Lower `-j` / `PARALLEL_JOBS`; each process needs roughly 700 MB. The preflight warns when the configured jobs exceed available memory.
 
 **`Path "..." cannot be used with directory "..."` during static content deployment.** A module or theme is registered from a path outside the Magento root (symlinked module). Move it inside the root; the build clone requires real files or hardlinks, not symlinks to other locations.
+
+**Git mode: every page fails right after a deployment that changed Composer packages** (`Plugin class … doesn't exist`, `Unknown named parameter …`), while the run reported success. Until 3.3.0 git mode swapped only the entries the deployed commit tracks; with `vendor/` in `.gitignore` the packages the build had installed or patched never went live, only `vendor/composer` and the generated code compiled against them did. `vendor/composer/installed.json` then claimed the new versions, so a later `composer install` on the live tree changed nothing either. Since 3.3.0 the build's `vendor/` is always part of the release and the post-swap check refuses a release without it. To repair a tree hit by this, run `composer install` in a fresh build (`deploy.sh --ref` again with 3.3.0), or re-apply the missing changes to the live `vendor/` by hand; `deploy.sh --rollback` restores generated code that does not match the live `vendor/` either.
 
 **A composer package silently stopped autoloading after a successful deployment.** Composer installs a package from a `path` repository as a relative symlink out of `vendor/` (`vendor/acme/sdk -> ../../composer/acme/sdk`), so its source lives outside the directories the build clone copies. Until 3.2.1 the link dangled in the build and `composer dump-autoload` dropped the package from the autoloader with a zero exit code — the deployment reported success and the classes were gone. Since 3.2.1 the clone carries those sources, and the build aborts if its autoloader registers fewer namespaces than the live one. A path repository whose source sits *outside* the Magento root still cannot be carried; the run warns about it, and the fix is to move it inside the root.
 

@@ -57,7 +57,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.2.1"
+DEPLOY_VERSION="3.3.0"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -204,6 +204,7 @@ PRE_DEPLOY_CMD="${PRE_DEPLOY_CMD:-}"
 POST_DEPLOY_CMD="${POST_DEPLOY_CMD:-}"
 OPCACHE_RESET_CMD="${OPCACHE_RESET_CMD:-}"
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
+HEALTHCHECK_RESOLVE="${HEALTHCHECK_RESOLVE:-}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-3}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-30}"
 DB_BACKUP="${DB_BACKUP:-false}"
@@ -859,6 +860,9 @@ HOOKS AND CHECKS (set in .deploy.env or the environment):
     HEALTHCHECK_URL     curl'ed after the release; anything but HTTP 2xx
                         (after HEALTHCHECK_RETRIES x HEALTHCHECK_TIMEOUT)
                         fails the deployment.
+    HEALTHCHECK_RESOLVE host:port:address passed to curl --resolve, so the
+                        check reaches the origin and not a CDN/WAF in front
+                        of it (e.g. www.example.com:443:10.0.0.5).
     DB_BACKUP=true      gzipped mysqldump into var/backups/ before
                         setup:upgrade (credentials from env.php).
     DB_BACKUP_CMD       Custom backup command used instead of mysqldump.
@@ -886,7 +890,7 @@ ENVIRONMENT VARIABLES:
     ARTIFACTS_DIR, BUILD_ONLY, AUTOLOAD_OPTIMIZE, STORE_CHECK, SKIP_COMPOSER, SKIP_DB_CHECK,
     SKIP_STATIC, SKIP_DI_COMPILE, VERBOSE, DRY_RUN, NO_INTERACTION,
     DEPLOY_ASCII, NO_COLOR, LOG_FILE, LOG_RETENTION_DAYS, PRE_DEPLOY_CMD,
-    POST_DEPLOY_CMD, OPCACHE_RESET_CMD, HEALTHCHECK_URL,
+    POST_DEPLOY_CMD, OPCACHE_RESET_CMD, HEALTHCHECK_URL, HEALTHCHECK_RESOLVE,
     HEALTHCHECK_RETRIES, HEALTHCHECK_TIMEOUT, DB_BACKUP, DB_BACKUP_CMD
 
 EXAMPLES:
@@ -1206,6 +1210,10 @@ validate_configuration() {
     if [[ -n "$HEALTHCHECK_URL" ]] && ! command -v curl >/dev/null 2>&1; then
         ui_warn "HEALTHCHECK_URL is set but curl is not available - health check will be skipped"
     fi
+    if [[ -n "$HEALTHCHECK_RESOLVE" ]] && ! [[ "$HEALTHCHECK_RESOLVE" =~ ^[^:]+:[0-9]+:.+$ ]]; then
+        ui_fail "Invalid HEALTHCHECK_RESOLVE '$HEALTHCHECK_RESOLVE' (expected host:port:address, e.g. www.example.com:443:10.0.0.5)"
+        (( errors++ ))
+    fi
     if [[ "$DB_BACKUP" == "true" && -z "$DB_BACKUP_CMD" ]] && ! command -v mysqldump >/dev/null 2>&1; then
         ui_fail "DB_BACKUP=true but mysqldump was not found (install a MySQL client or set DB_BACKUP_CMD)"
         (( errors++ ))
@@ -1379,17 +1387,25 @@ health_check() {
         return 0
     fi
 
+    # A CDN or WAF in front of the store may answer instead of the origin
+    # (a bot challenge, a cached page); --resolve pins the request to it
+    local resolve=() via=""
+    if [[ -n "$HEALTHCHECK_RESOLVE" ]]; then
+        resolve=(--resolve "$HEALTHCHECK_RESOLVE")
+        via=" via ${HEALTHCHECK_RESOLVE#*:*:}"
+    fi
     local attempt=0 http_code=""
     while (( attempt < HEALTHCHECK_RETRIES )); do
         (( attempt++ ))
         http_code="$(curl -sS -L --max-redirs 5 -o /dev/null -w '%{http_code}' \
+            ${resolve[@]+"${resolve[@]}"} \
             --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL" 2>>"$LOG_FILE")" || true
         if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-            ui_ok "Health check: $HEALTHCHECK_URL $SYM_ARROW HTTP $http_code" "(attempt $attempt, $(format_duration $(( SECONDS - start ))))"
+            ui_ok "Health check: $HEALTHCHECK_URL$via $SYM_ARROW HTTP $http_code" "(attempt $attempt, $(format_duration $(( SECONDS - start ))))"
             record_step_time "Health check" $(( SECONDS - start ))
             return 0
         fi
-        ui_warn "Health check attempt $attempt/$HEALTHCHECK_RETRIES: HTTP ${http_code:-no response}"
+        ui_warn "Health check attempt $attempt/$HEALTHCHECK_RETRIES$via: HTTP ${http_code:-no response}"
         (( attempt < HEALTHCHECK_RETRIES )) && sleep "$RETRY_DELAY"
     done
 
@@ -1882,6 +1898,13 @@ plan_code_swap() {
         esac
         SWAP_CODE_ITEMS+=("$entry")
     done < <(cd "$MAGENTO_DIR" && git ls-tree --name-only "$GIT_SHA" pub/ 2>/dev/null)
+    # vendor/ is usually ignored, yet composer install in the build changes it
+    # (new versions, re-applied patches) and the generated code is compiled
+    # against that tree: it has to go live with the code, tracked or not
+    case " ${SWAP_CODE_ITEMS[*]-} " in
+        *" vendor "*) ;;
+        *) SWAP_CODE_ITEMS+=("vendor") ;;
+    esac
 
     # entries tracked by the current commit but gone in the new one
     local old
@@ -2322,6 +2345,8 @@ import_artifacts() {
 }
 
 build_phase() {
+    # leftovers of an earlier run that failed after its swap
+    [[ "$DRY_RUN" != "true" ]] && purge_discarded
     if [[ -n "$ARTIFACTS_DIR" ]]; then
         import_artifacts
         return 0
@@ -2379,12 +2404,27 @@ disable_maintenance() {
 # PHASE: Release
 # ───────────────────────────────────────────────────────────────────
 
+# The previous release holds a whole vendor/ in git mode: deleting it can
+# take minutes, and the swap may run inside a maintenance window. It is
+# renamed out of the way instead and purged once the site is serving.
+discard_dir() {
+    local dir="$1"
+    [[ -e "$dir" ]] || return 0
+    mv "$dir" "$dir.discard.$$" 2>/dev/null || rm -rf "$dir"
+}
+
+purge_discarded() {
+    rm -rf "$BUILD_DIR"/*.discard.* 2>/dev/null
+    return 0
+}
+
 # Move one artifact from the build into place, keeping the live one in
 # PREVIOUS_DIR. Two renames: the gap is microseconds.
 swap_item() {
     local rel="$1"
     local live="$MAGENTO_DIR/$rel" new="$BUILD_ROOT/$rel" prev="$PREVIOUS_DIR/$rel"
-    [[ -e "$new" ]] || return 0
+    # nothing built for it: not swapped (and not recorded for --rollback)
+    [[ -e "$new" ]] || return 1
     mkdir -p "$(dirname "$prev")"
     if [[ -e "$live" ]]; then
         mv "$live" "$prev" || die "Could not move $rel aside (live site unchanged)"
@@ -2442,8 +2482,14 @@ swap_artifacts() {
     fi
 
     if [[ "$GIT_MODE" == "true" ]]; then
+        # vendor/composer and vendor/autoload.php go live inside vendor/
+        local artifacts=()
+        for entry in ${items[@]+"${items[@]}"}; do
+            [[ "$entry" == vendor/* ]] && continue
+            artifacts+=("$entry")
+        done
         # code first, so app/ vendor/ and generated/ change as one release
-        items=(${SWAP_CODE_ITEMS[@]+"${SWAP_CODE_ITEMS[@]}"} ${items[@]+"${items[@]}"})
+        items=(${SWAP_CODE_ITEMS[@]+"${SWAP_CODE_ITEMS[@]}"} ${artifacts[@]+"${artifacts[@]}"})
     fi
 
     if (( ${#items[@]} == 0 )); then
@@ -2457,7 +2503,8 @@ swap_artifacts() {
         return 0
     fi
 
-    rm -rf "$PREVIOUS_DIR" "$FAILED_DIR"
+    discard_dir "$PREVIOUS_DIR"
+    discard_dir "$FAILED_DIR"
     mkdir -p "$PREVIOUS_DIR"
     {
         echo "version=1"
@@ -2467,8 +2514,7 @@ swap_artifacts() {
         echo "git_new=$GIT_SHA"
     } > "$PREVIOUS_DIR/.manifest"
     for entry in "${items[@]}"; do
-        swap_item "$entry"
-        echo "swapped $entry" >> "$PREVIOUS_DIR/.manifest"
+        swap_item "$entry" && echo "swapped $entry" >> "$PREVIOUS_DIR/.manifest"
     done
     for entry in ${RETIRE_CODE_ITEMS[@]+"${RETIRE_CODE_ITEMS[@]}"} ${retire[@]+"${retire[@]}"}; do
         retire_item "$entry"
@@ -2506,6 +2552,10 @@ verify_swap() {
         [[ -d "$MAGENTO_DIR/generated/code" ]] && [[ -n "$(ls -A "$MAGENTO_DIR/generated/code" 2>/dev/null)" ]] \
             || problems+=("generated/code is missing or empty")
         [[ -f "$MAGENTO_DIR/vendor/autoload.php" ]] || problems+=("vendor/autoload.php is missing")
+    fi
+    # the generated code was compiled against the build's vendor/
+    if [[ "$GIT_MODE" == "true" && -d "$BUILD_ROOT/vendor" ]]; then
+        problems+=("the build's vendor/ was not released - live vendor/ does not match the generated code")
     fi
     if ! check="$(verify_classmap "$MAGENTO_DIR")"; then
         problems+=("classmap references missing generated files: $(printf '%s ' "$check")")
@@ -2664,7 +2714,10 @@ verify_phase() {
     ui_phase "Verify"
     health_check
     post_deployment_checks
-    [[ "$BUILD_ONLY" != "true" && "$DRY_RUN" != "true" ]] && rm -rf "$BUILD_ROOT"
+    if [[ "$BUILD_ONLY" != "true" && "$DRY_RUN" != "true" ]]; then
+        rm -rf "$BUILD_ROOT"
+        purge_discarded
+    fi
     return 0
 }
 
@@ -2704,7 +2757,7 @@ rollback_command() {
     fi
 
     local start=$SECONDS rel kind failed=0
-    rm -rf "$FAILED_DIR"
+    discard_dir "$FAILED_DIR"
     mkdir -p "$FAILED_DIR"
     for (( i = ${#entries[@]} - 1; i >= 0; i-- )); do
         kind="${entries[$i]%% *}"
@@ -2747,6 +2800,7 @@ rollback_command() {
     ui_phase "Verify"
     health_check
     post_deployment_checks
+    purge_discarded
     return 0
 }
 
@@ -2885,7 +2939,7 @@ CONFIGURATION:
   Source:            ${GIT_REF:+git $GIT_REF ${GIT_SHA:0:10} (was ${GIT_PREVIOUS_SHA:0:10})}${GIT_REF:-code in place}
   Artifacts swapped: $ARTIFACTS_SWAPPED (${SWAPPED_ITEMS[*]-none})
   DB backup:         ${LAST_BACKUP_FILE:-none}
-  Health check:      ${HEALTHCHECK_URL:-none}
+  Health check:      ${HEALTHCHECK_URL:-none}${HEALTHCHECK_RESOLVE:+ (resolve $HEALTHCHECK_RESOLVE)}
 
 STEP TIMINGS:
 $(format_step_timings)
@@ -2998,7 +3052,7 @@ display_config() {
         ui_kv "Source" "code in place  ${DIM}(git pull before running, or use --ref)${RESET}"
     fi
     [[ -n "$ARTIFACTS_DIR" ]] && ui_kv "Artifacts" "$ARTIFACTS_DIR"
-    [[ -n "$HEALTHCHECK_URL" ]] && ui_kv "Health check" "$HEALTHCHECK_URL"
+    [[ -n "$HEALTHCHECK_URL" ]] && ui_kv "Health check" "$HEALTHCHECK_URL${HEALTHCHECK_RESOLVE:+  ${DIM}(resolve $HEALTHCHECK_RESOLVE)${RESET}}"
     [[ "$DB_BACKUP" == "true" || -n "$DB_BACKUP_CMD" ]] && ui_kv "DB backup" "enabled"
     [[ -n "$OPCACHE_RESET_CMD" ]] && ui_kv "OPcache reset" "$OPCACHE_RESET_CMD"
     ui_kv "Log" "$LOG_FILE"
@@ -3221,6 +3275,8 @@ MAINTENANCE=auto
 
 # Storefront URL checked after the release (expects HTTP 2xx)
 ${healthcheck:+HEALTHCHECK_URL=$healthcheck}${healthcheck:-#HEALTHCHECK_URL=https://www.example.com/}
+# Behind a CDN/WAF: send the check to the origin (host:port:address)
+#HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5
 
 # Back up the database before setup:upgrade
 #DB_BACKUP=true
