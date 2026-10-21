@@ -57,7 +57,7 @@
 
 set -uo pipefail
 
-DEPLOY_VERSION="3.3.0"
+DEPLOY_VERSION="3.3.1"
 readonly DEPLOY_VERSION
 
 PLATFORM="$(uname -s)"
@@ -205,6 +205,7 @@ POST_DEPLOY_CMD="${POST_DEPLOY_CMD:-}"
 OPCACHE_RESET_CMD="${OPCACHE_RESET_CMD:-}"
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 HEALTHCHECK_RESOLVE="${HEALTHCHECK_RESOLVE:-}"
+HEALTHCHECK_INSECURE="${HEALTHCHECK_INSECURE:-false}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-3}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-30}"
 DB_BACKUP="${DB_BACKUP:-false}"
@@ -863,6 +864,9 @@ HOOKS AND CHECKS (set in .deploy.env or the environment):
     HEALTHCHECK_RESOLVE host:port:address passed to curl --resolve, so the
                         check reaches the origin and not a CDN/WAF in front
                         of it (e.g. www.example.com:443:10.0.0.5).
+    HEALTHCHECK_INSECURE=true  skip TLS verification of the health check
+                        (an origin behind a CDN often serves a certificate
+                        for another name, or an expired one).
     DB_BACKUP=true      gzipped mysqldump into var/backups/ before
                         setup:upgrade (credentials from env.php).
     DB_BACKUP_CMD       Custom backup command used instead of mysqldump.
@@ -891,7 +895,8 @@ ENVIRONMENT VARIABLES:
     SKIP_STATIC, SKIP_DI_COMPILE, VERBOSE, DRY_RUN, NO_INTERACTION,
     DEPLOY_ASCII, NO_COLOR, LOG_FILE, LOG_RETENTION_DAYS, PRE_DEPLOY_CMD,
     POST_DEPLOY_CMD, OPCACHE_RESET_CMD, HEALTHCHECK_URL, HEALTHCHECK_RESOLVE,
-    HEALTHCHECK_RETRIES, HEALTHCHECK_TIMEOUT, DB_BACKUP, DB_BACKUP_CMD
+    HEALTHCHECK_INSECURE, HEALTHCHECK_RETRIES, HEALTHCHECK_TIMEOUT, DB_BACKUP,
+    DB_BACKUP_CMD
 
 EXAMPLES:
     deploy.sh --init                          # Generate .deploy.env
@@ -1214,6 +1219,10 @@ validate_configuration() {
         ui_fail "Invalid HEALTHCHECK_RESOLVE '$HEALTHCHECK_RESOLVE' (expected host:port:address, e.g. www.example.com:443:10.0.0.5)"
         (( errors++ ))
     fi
+    case "$HEALTHCHECK_INSECURE" in
+        true|false) ;;
+        *) ui_warn "Invalid HEALTHCHECK_INSECURE '$HEALTHCHECK_INSECURE' (true/false), using false"; HEALTHCHECK_INSECURE=false ;;
+    esac
     if [[ "$DB_BACKUP" == "true" && -z "$DB_BACKUP_CMD" ]] && ! command -v mysqldump >/dev/null 2>&1; then
         ui_fail "DB_BACKUP=true but mysqldump was not found (install a MySQL client or set DB_BACKUP_CMD)"
         (( errors++ ))
@@ -1394,6 +1403,9 @@ health_check() {
         resolve=(--resolve "$HEALTHCHECK_RESOLVE")
         via=" via ${HEALTHCHECK_RESOLVE#*:*:}"
     fi
+    # The origin's own certificate may not match the public name (or be
+    # expired) when only the CDN terminates TLS for visitors
+    [[ "$HEALTHCHECK_INSECURE" == "true" ]] && resolve+=(--insecure)
     local attempt=0 http_code=""
     while (( attempt < HEALTHCHECK_RETRIES )); do
         (( attempt++ ))
@@ -2939,7 +2951,7 @@ CONFIGURATION:
   Source:            ${GIT_REF:+git $GIT_REF ${GIT_SHA:0:10} (was ${GIT_PREVIOUS_SHA:0:10})}${GIT_REF:-code in place}
   Artifacts swapped: $ARTIFACTS_SWAPPED (${SWAPPED_ITEMS[*]-none})
   DB backup:         ${LAST_BACKUP_FILE:-none}
-  Health check:      ${HEALTHCHECK_URL:-none}${HEALTHCHECK_RESOLVE:+ (resolve $HEALTHCHECK_RESOLVE)}
+  Health check:      ${HEALTHCHECK_URL:-none}${HEALTHCHECK_RESOLVE:+ (resolve $HEALTHCHECK_RESOLVE)}$([[ "$HEALTHCHECK_INSECURE" == "true" ]] && echo " (TLS not verified)")
 
 STEP TIMINGS:
 $(format_step_timings)
@@ -3052,7 +3064,7 @@ display_config() {
         ui_kv "Source" "code in place  ${DIM}(git pull before running, or use --ref)${RESET}"
     fi
     [[ -n "$ARTIFACTS_DIR" ]] && ui_kv "Artifacts" "$ARTIFACTS_DIR"
-    [[ -n "$HEALTHCHECK_URL" ]] && ui_kv "Health check" "$HEALTHCHECK_URL${HEALTHCHECK_RESOLVE:+  ${DIM}(resolve $HEALTHCHECK_RESOLVE)${RESET}}"
+    [[ -n "$HEALTHCHECK_URL" ]] && ui_kv "Health check" "$HEALTHCHECK_URL${HEALTHCHECK_RESOLVE:+  ${DIM}(resolve $HEALTHCHECK_RESOLVE)${RESET}}$([[ "$HEALTHCHECK_INSECURE" == "true" ]] && echo "  ${DIM}(TLS not verified)${RESET}")"
     [[ "$DB_BACKUP" == "true" || -n "$DB_BACKUP_CMD" ]] && ui_kv "DB backup" "enabled"
     [[ -n "$OPCACHE_RESET_CMD" ]] && ui_kv "OPcache reset" "$OPCACHE_RESET_CMD"
     ui_kv "Log" "$LOG_FILE"
@@ -3277,6 +3289,8 @@ MAINTENANCE=auto
 ${healthcheck:+HEALTHCHECK_URL=$healthcheck}${healthcheck:-#HEALTHCHECK_URL=https://www.example.com/}
 # Behind a CDN/WAF: send the check to the origin (host:port:address)
 #HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5
+# ...and skip TLS verification when the origin certificate is for another name
+#HEALTHCHECK_INSECURE=true
 
 # Back up the database before setup:upgrade
 #DB_BACKUP=true

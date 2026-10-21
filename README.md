@@ -238,7 +238,7 @@ The phase header says whether a maintenance window will be used and why.
 
 ### 7. Verify
 
-- **Health check**: `curl` fetches `HEALTHCHECK_URL` (redirects followed) up to `HEALTHCHECK_RETRIES` times with `HEALTHCHECK_TIMEOUT` seconds each; anything but HTTP 2xx fails the deployment. Behind a CDN or WAF (Cloudflare, Fastly, a bot challenge) the edge may answer instead of the shop, in either direction: a 403 challenge for a healthy release, or a cached 200 for a broken one. Set `HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5` to send the request straight to the origin (`curl --resolve`); the hostname, TLS name and `Host` header stay the same.
+- **Health check**: `curl` fetches `HEALTHCHECK_URL` (redirects followed) up to `HEALTHCHECK_RETRIES` times with `HEALTHCHECK_TIMEOUT` seconds each; anything but HTTP 2xx fails the deployment. Behind a CDN or WAF (Cloudflare, Fastly, a bot challenge) the edge may answer instead of the shop, in either direction: a 403 challenge for a healthy release, or a cached 200 for a broken one. Set `HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5` to send the request straight to the origin (`curl --resolve`); the hostname, TLS name and `Host` header stay the same. When only the CDN terminates TLS, the origin's certificate is often for another name or expired; `HEALTHCHECK_INSECURE=true` then skips verification (`curl --insecure`) for the check alone.
 - **Post-deployment checks**: file counts of `generated/code`, `generated/metadata`, `pub/static`, presence of `pub/static/deployed_version.txt`, application mode, maintenance status.
 - The build clone is removed. The previous release stays in `var/deploy/previous` until the next deployment replaces it, so `--rollback` remains possible after a deployment that verified fine but turns out to be bad.
 
@@ -394,6 +394,7 @@ Set in `.deploy.env` (KEY=VALUE, `#` comments, quotes optional) or the environme
 | `HEALTHCHECK_URL` | empty | URL expected to return HTTP 2xx after the release. |
 | `HEALTHCHECK_RESOLVE` | empty | `host:port:address` for `curl --resolve`: sends the health check to the origin server instead of a CDN/WAF in front of it. |
 | `HEALTHCHECK_RETRIES` | `3` | Attempts. |
+| `HEALTHCHECK_INSECURE` | `false` | `true` skips TLS verification of the health check (an origin certificate for another name, or an expired one). |
 | `HEALTHCHECK_TIMEOUT` | `30` | Seconds per attempt. |
 | `DB_BACKUP` | `false` | Built-in mysqldump before `setup:upgrade`. |
 | `DB_BACKUP_CMD` | empty | Custom backup command instead of mysqldump. |

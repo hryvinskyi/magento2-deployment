@@ -277,7 +277,7 @@ setup_sandbox() {
         FAKE_STORE_THEMES FAKE_STORE_LOCALES FAKE_ADMIN_LOCALES FAKE_STORE_DB_DOWN FAKE_CLASSMAP_MISSING \
         FAKE_UPGRADE_FAILS_ON_FLAG FAKE_TOUCH_REGENERATE_ON FAKE_COMPOSER_REINSTALL AUTOLOAD_OPTIMIZE STORE_CHECK \
         FAKE_HTTP_CODE FAKE_SCD_SLEEP MAINTENANCE MAINTENANCE_ALLOWED_IPS DB_UPGRADE PRE_DEPLOY_CMD \
-        POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RESOLVE HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
+        POST_DEPLOY_CMD OPCACHE_RESET_CMD HEALTHCHECK_URL HEALTHCHECK_RESOLVE HEALTHCHECK_INSECURE HEALTHCHECK_RETRIES HEALTHCHECK_TIMEOUT \
         DB_BACKUP DB_BACKUP_CMD SCD_EXTRA_ARGS 2>/dev/null
 }
 
@@ -1028,7 +1028,13 @@ run_deploy --skip-static --skip-di-compile
 assert_exit $RC 0 "deploy with a resolved health check exits 0"
 assert_grep "$FAKE_LOG_FILE" "CURL .*--resolve shop.example.test:443:10.0.0.5 .*https://shop.example.test/" "health check pinned to the origin with --resolve"
 assert_grep "$OUT" "via 10.0.0.5" "summary names the pinned address"
-unset HEALTHCHECK_URL HEALTHCHECK_RESOLVE
+assert_not_grep "$FAKE_LOG_FILE" "CURL .*--insecure" "TLS verified unless HEALTHCHECK_INSECURE=true"
+setup_sandbox
+export HEALTHCHECK_URL='https://shop.example.test/' HEALTHCHECK_RESOLVE='shop.example.test:443:10.0.0.5' HEALTHCHECK_INSECURE=true
+run_deploy --skip-static --skip-di-compile
+assert_exit $RC 0 "deploy with an unverified health check exits 0"
+assert_grep "$FAKE_LOG_FILE" "CURL .*--resolve shop.example.test:443:10.0.0.5 --insecure .*https://shop.example.test/" "HEALTHCHECK_INSECURE=true skips TLS verification"
+unset HEALTHCHECK_URL HEALTHCHECK_RESOLVE HEALTHCHECK_INSECURE
 
 echo "=== T31: developer mode is switched to production ==="
 setup_sandbox

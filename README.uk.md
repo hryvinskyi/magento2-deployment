@@ -238,7 +238,7 @@ php -d memory_limit=-1 var/deploy/build/bin/magento setup:static-content:deploy 
 
 ### 7. Verify
 
-- **Health check**: `curl` запитує `HEALTHCHECK_URL` (з переходом за редиректами) до `HEALTHCHECK_RETRIES` разів по `HEALTHCHECK_TIMEOUT` секунд; усе, крім HTTP 2xx, провалює деплой. За CDN чи WAF (Cloudflare, Fastly, bot challenge) замість магазину може відповідати edge, і похибка буває в обидва боки: 403-челендж для здорового релізу або закешований 200 для зламаного. `HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5` шле запит прямо на origin (`curl --resolve`); хост, TLS-ім'я та заголовок `Host` лишаються ті самі.
+- **Health check**: `curl` запитує `HEALTHCHECK_URL` (з переходом за редиректами) до `HEALTHCHECK_RETRIES` разів по `HEALTHCHECK_TIMEOUT` секунд; усе, крім HTTP 2xx, провалює деплой. За CDN чи WAF (Cloudflare, Fastly, bot challenge) замість магазину може відповідати edge, і похибка буває в обидва боки: 403-челендж для здорового релізу або закешований 200 для зламаного. `HEALTHCHECK_RESOLVE=www.example.com:443:10.0.0.5` шле запит прямо на origin (`curl --resolve`); хост, TLS-ім'я та заголовок `Host` лишаються ті самі. Коли TLS для відвідувачів завершує лише CDN, сертифікат origin часто виданий на інше ім'я або прострочений; тоді `HEALTHCHECK_INSECURE=true` вимикає його перевірку (`curl --insecure`) лише для health check.
 - **Пост-перевірки**: кількість файлів у `generated/code`, `generated/metadata`, `pub/static`, наявність `pub/static/deployed_version.txt`, режим застосунку, статус maintenance.
 - Build-клон прибирається. Попередній реліз лишається у `var/deploy/previous`, доки наступний деплой його не замінить, тож `--rollback` можливий і після деплою, який пройшов перевірку, але виявився поганим.
 
@@ -394,6 +394,7 @@ Maintenance-режим навмисно **не** вимикається авто
 | `HEALTHCHECK_URL` | порожньо | URL, який після релізу має повернути HTTP 2xx. |
 | `HEALTHCHECK_RESOLVE` | порожньо | `host:port:address` для `curl --resolve`: health check іде на origin-сервер, а не на CDN/WAF перед ним. |
 | `HEALTHCHECK_RETRIES` | `3` | Кількість спроб. |
+| `HEALTHCHECK_INSECURE` | `false` | `true` вимикає перевірку TLS для health check (сертифікат origin на інше ім'я або прострочений). |
 | `HEALTHCHECK_TIMEOUT` | `30` | Секунд на спробу. |
 | `DB_BACKUP` | `false` | Вбудований mysqldump перед `setup:upgrade`. |
 | `DB_BACKUP_CMD` | порожньо | Власна команда бекапу замість mysqldump. |
